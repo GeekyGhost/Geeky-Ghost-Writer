@@ -108,6 +108,8 @@ For best results, use one of these Ollama models:
 - `phi` (faster, lighter model)
 - `gemma` (Google's efficient model)
 
+> **💡 Model Management Tip**: For an easy way to download, manage, and configure your Ollama models, check out [Little Geeky's Learning UI](https://github.com/GeekyGhost/Little-Geeky-s-Learning-UI.git) - a companion tool that provides a user-friendly interface for Ollama model management.
+
 ### Project Structure
 
 Generated content is saved in the `book_output` directory with this structure:
@@ -161,6 +163,10 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## 🤝 Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 🔗 Related Projects
+
+- [Little Geeky's Learning UI](https://github.com/GeekyGhost/Little-Geeky-s-Learning-UI.git): A companion tool for managing your Ollama models with a user-friendly interface
 
 ---
 
