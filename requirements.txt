@@ -1,0 +1,28 @@
+# Core dependencies
+gradio>=4.0.0
+requests>=2.25.0
+ollama>=0.1.0
+typing>=3.7.4
+
+# UI dependencies
+markdown>=3.3.0
+pyyaml>=6.0
+
+# File operations
+python-dateutil>=2.8.2
+shutil36>=0.1.2
+
+# Text processing
+regex>=2022.9.13
+
+# TTS dependencies
+kokoro
+misaki>=0.2.0
+soundfile>=0.12.1
+torch>=2.0.0
+numpy>=1.24.0
+
+# Development dependencies
+black>=22.0.0  # For code formatting
+flake8>=4.0.0  # For linting
+mypy>=0.910  # For type checking
