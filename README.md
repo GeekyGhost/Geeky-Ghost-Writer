@@ -1,5 +1,8 @@
 # Geeky Ghost Writer
 
+<img width="1182" alt="Screenshot 2025-04-02 143716" src="https://github.com/user-attachments/assets/f9930cfa-99c7-46e5-a9fe-dffd2efb1dee" />
+
+
 A powerful book generation application that leverages Ollama's local LLMs to create complete books through an intuitive Gradio interface. This tool helps writers outline, generate, and edit full-length books with minimal effort.
 
 ## ✨ Features
