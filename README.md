@@ -166,7 +166,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 🔗 Related Projects
 
-- [Little Geeky's Learning UI](https://github.com/GeekyGhost/Little-Geeky-s-Learning-UI.git): A companion tool for managing your Ollama models with a user-friendly interface
+- [Little Geeky's Learning UI](https://github.com/GeekyGhost/Little-Geeky-s-Learning-UI.git): For now, you can use this as a companion tool for managing your Ollama models with a user-friendly interface
 
 ---
 
