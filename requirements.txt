@@ -5,3 +5,7 @@ markdown>=3.3.0
 pyyaml>=6.0
 python-dateutil>=2.8.2
 regex>=2022.9.13
+# Optional dependencies for export formats
+reportlab>=3.6.0
+ebooklib>=0.17.1
+python-docx>=0.8.11
