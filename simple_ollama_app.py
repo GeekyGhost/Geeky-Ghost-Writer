@@ -305,6 +305,18 @@ def create_safe_dropdown(label, choices, default_index=0, allow_custom=True):
         allow_custom_value=allow_custom
     )
 
+def format_outline_for_display():
+    """Format the current outline for display in the UI"""
+    if not current_outline:
+        return ""
+    
+    formatted_outline = "# Generated Book Outline\n\n"
+    for chapter in current_outline:
+        formatted_outline += f"## Chapter {chapter['chapter_number']}: {chapter['title']}\n"
+        formatted_outline += f"{chapter['prompt']}\n\n"
+    
+    return formatted_outline
+
 def scan_project_folders():
     """Scan book_output directory and return a list of valid projects with full paths"""
     projects = []
@@ -3090,8 +3102,7 @@ def create_gradio_interface():
                     series_dropdown = gr.Dropdown(
                         label="Add to Series (Optional)",
                         choices=[("No Series", "")] + get_existing_series(),
-                        value="No Series",
-                        allow_custom_value=True
+                        value="No Series"
                     )
                     
                     create_btn = gr.Button("Create New Book Project", variant="primary")
@@ -3125,7 +3136,7 @@ def create_gradio_interface():
                         label="Select a project to load",
                         choices=[("Select a project", "")] + get_existing_projects(),
                         value="Select a project",
-                        allow_custom_value=True
+                        allow_custom_value=True  # Fix for the warning about values not in list
                     )
                     
                     load_btn = gr.Button("Load Selected Project")
@@ -3141,8 +3152,7 @@ def create_gradio_interface():
                         add_to_series_dropdown = gr.Dropdown(
                             label="Select Series",
                             choices=[("Select a series", "")] + get_existing_series(),
-                            value="Select a series",
-                            allow_custom_value=True
+                            value="Select a series"
                         )
                         add_to_series_btn = gr.Button("Add to Selected Series", variant="primary")
         
@@ -3173,8 +3183,7 @@ def create_gradio_interface():
                     reading_level_input = gr.Dropdown(
                         label="Reading Level",
                         choices=["Early Reader", "Children", "Middle Grade", "Young Adult", "Adult", "General"],
-                        value="General",
-                        allow_custom_value=True
+                        value="General"
                     )
                     
                     set_audience_btn = gr.Button("Set Age Range & Reading Level", variant="primary")
@@ -3188,8 +3197,7 @@ def create_gradio_interface():
                             "ADHD", "Autism", "Dyslexia", "Language Processing", 
                             "Visual Processing", "Sensory Sensitivity", "Other"
                         ],
-                        value="ADHD",
-                        allow_custom_value=True
+                        value="ADHD"
                     )
                     
                     accom_desc_input = gr.Textbox(
@@ -3240,8 +3248,7 @@ def create_gradio_interface():
                         wb_select = gr.Dropdown(
                             label="Select Element",
                             choices=get_world_building_categories(),
-                            value="Select a category",
-                            allow_custom_value=True
+                            value="Select a category"
                         )
                         
                         # Get content button
@@ -3312,22 +3319,19 @@ def create_gradio_interface():
                         wb_hier_category_select = gr.Dropdown(
                             label="Select Category",
                             choices=get_world_building_hierarchy_categories(),
-                            value="Select a category",
-                            allow_custom_value=True
+                            value="Select a category"
                         )
                         
                         wb_hier_subcategory_select = gr.Dropdown(
                             label="Select Subcategory",
                             choices=["Select a category first"],
-                            value="Select a category first",
-                            allow_custom_value=True
+                            value="Select a category first"
                         )
                         
                         wb_hier_element_select = gr.Dropdown(
                             label="Select Element",
                             choices=["Select a subcategory first"],
-                            value="Select a subcategory first",
-                            allow_custom_value=True
+                            value="Select a subcategory first"
                         )
                         
                         # Get element content button
@@ -3370,8 +3374,7 @@ def create_gradio_interface():
                         char_select = gr.Dropdown(
                             label="Select Character",
                             choices=get_character_names(),
-                            value="Select a character",
-                            allow_custom_value=True
+                            value="Select a character"
                         )
                         
                         # Get character button
@@ -3401,15 +3404,13 @@ def create_gradio_interface():
                         char1_select = gr.Dropdown(
                             label="Character 1",
                             choices=get_character_names(),
-                            value="Select a character",
-                            allow_custom_value=True
+                            value="Select a character"
                         )
                         
                         char2_select = gr.Dropdown(
                             label="Character 2",
                             choices=get_character_names(),
-                            value="Select a character",
-                            allow_custom_value=True
+                            value="Select a character"
                         )
                         
                         relationship_type = gr.Dropdown(
@@ -3418,8 +3419,7 @@ def create_gradio_interface():
                                 "Family", "Friends", "Allies", "Rivals", "Enemies", 
                                 "Lovers", "Teacher/Student", "Employer/Employee", "Other"
                             ],
-                            value="Friends",
-                            allow_custom_value=True
+                            value="Friends"
                         )
                         
                         relationship_desc = gr.Textbox(
@@ -3443,8 +3443,7 @@ def create_gradio_interface():
                         arc_char_select = gr.Dropdown(
                             label="Select Character",
                             choices=get_character_names(),
-                            value="Select a character",
-                            allow_custom_value=True
+                            value="Select a character"
                         )
                         
                         arc_points = gr.Textbox(
@@ -3517,8 +3516,7 @@ def create_gradio_interface():
                         models_dropdown = gr.Dropdown(
                             label="Ollama Model",
                             choices=get_ollama_models(),
-                            value="mistral",
-                            allow_custom_value=True
+                            value="mistral"
                         )
                     
                     with gr.Row():
@@ -3612,8 +3610,7 @@ def create_gradio_interface():
                     project_files_dropdown = gr.Dropdown(
                         label="Select a file to view",
                         choices=get_project_file_options(),
-                        value="Select a file",
-                        allow_custom_value=True
+                        value="Select a file"
                     )
                     
                     # Export options
@@ -3631,8 +3628,7 @@ def create_gradio_interface():
                     export_format = gr.Dropdown(
                         label="Export Format",
                         choices=available_formats,
-                        value="txt",
-                        allow_custom_value=True
+                        value="txt"
                     )
                     
                     # Show library information for missing formats
@@ -3676,8 +3672,7 @@ def create_gradio_interface():
             lambda: gr.Dropdown(
                 label="Add to Series (Optional)",
                 choices=[("No Series", "")] + get_existing_series(),
-                value="No Series",
-                allow_custom_value=True
+                value="No Series"
             ),
             inputs=None,
             outputs=[series_dropdown]
@@ -3685,8 +3680,7 @@ def create_gradio_interface():
             lambda: gr.Dropdown(
                 label="Select Series",
                 choices=[("Select a series", "")] + get_existing_series(),
-                value="Select a series",
-                allow_custom_value=True
+                value="Select a series"
             ),
             inputs=None,
             outputs=[add_to_series_dropdown]
@@ -3703,7 +3697,7 @@ def create_gradio_interface():
             outputs=[current_book_info]
         )
         
-        # Load project
+        # Load project - UPDATED to refresh all UI components
         load_btn.click(
             lambda selection: load_book_project(selection) if selection else "No project selected.",
             inputs=[project_dropdown],
@@ -3720,6 +3714,58 @@ def create_gradio_interface():
             ),
             inputs=None,
             outputs=[chapter_selection]
+        ).then(
+            format_outline_for_display,
+            inputs=[],
+            outputs=[outline_output]
+        ).then(
+            get_world_building_display,
+            inputs=[],
+            outputs=[wb_display]
+        ).then(
+            get_world_building_hierarchy_display,
+            inputs=[],
+            outputs=[wb_hier_display]
+        ).then(
+            get_characters_display,
+            inputs=[],
+            outputs=[char_display]
+        ).then(
+            get_character_relationships_display,
+            inputs=[],
+            outputs=[relationships_display]
+        ).then(
+            get_character_arcs_display,
+            inputs=[],
+            outputs=[arcs_display]
+        ).then(
+            get_target_audience_display,
+            inputs=[],
+            outputs=[audience_display]
+        ).then(
+            lambda: refresh_wb_categories(),
+            inputs=None,
+            outputs=[wb_select]
+        ).then(
+            lambda: refresh_wb_hierarchy_categories(),
+            inputs=None,
+            outputs=[wb_hier_category_select]
+        ).then(
+            lambda: refresh_char_names(),
+            inputs=None,
+            outputs=[char_select]
+        ).then(
+            lambda: refresh_char_names(),
+            inputs=None,
+            outputs=[char1_select]
+        ).then(
+            lambda: refresh_char_names(),
+            inputs=None,
+            outputs=[char2_select]
+        ).then(
+            lambda: refresh_char_names(),
+            inputs=None,
+            outputs=[arc_char_select]
         )
         
         # Refresh project list
@@ -3728,7 +3774,7 @@ def create_gradio_interface():
                 label="Select a project to load",
                 choices=[("Select a project", "")] + get_existing_projects(),
                 value="Select a project",
-                allow_custom_value=True
+                allow_custom_value=True  # Fix for the warning about values not in list
             ),
             inputs=None,
             outputs=[project_dropdown]
@@ -3770,8 +3816,7 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select Element",
                 choices=get_world_building_categories(),
-                value="Select a category",
-                allow_custom_value=True
+                value="Select a category"
             )
         
         wb_add_btn.click(
@@ -3830,8 +3875,7 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select Category",
                 choices=get_world_building_hierarchy_categories(),
-                value="Select a category",
-                allow_custom_value=True
+                value="Select a category"
             )
         
         def update_subcategory_dropdown(category):
@@ -3839,15 +3883,13 @@ def create_gradio_interface():
                 return gr.Dropdown(
                     label="Select Subcategory",
                     choices=get_world_building_subcategories(category),
-                    value="Select a subcategory",
-                    allow_custom_value=True
+                    value="Select a subcategory"
                 )
             else:
                 return gr.Dropdown(
                     label="Select Subcategory",
                     choices=["Select a category first"],
-                    value="Select a category first",
-                    allow_custom_value=True
+                    value="Select a category first"
                 )
         
         def update_element_dropdown(category, subcategory):
@@ -3855,15 +3897,13 @@ def create_gradio_interface():
                 return gr.Dropdown(
                     label="Select Element",
                     choices=get_world_building_elements(category, subcategory),
-                    value="Select an element",
-                    allow_custom_value=True
+                    value="Select an element"
                 )
             else:
                 return gr.Dropdown(
                     label="Select Element",
                     choices=["Select a subcategory first"],
-                    value="Select a subcategory first",
-                    allow_custom_value=True
+                    value="Select a subcategory first"
                 )
         
         wb_hier_add_btn.click(
@@ -3905,8 +3945,7 @@ def create_gradio_interface():
             lambda: gr.Dropdown(
                 label="Select Element",
                 choices=["Select a subcategory first"],
-                value="Select a subcategory first",
-                allow_custom_value=True
+                value="Select a subcategory first"
             ),
             inputs=None,
             outputs=[wb_hier_element_select]
@@ -3963,11 +4002,9 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select Character",
                 choices=get_character_names(),
-                value="Select a character",
-                allow_custom_value=True
+                value="Select a character"
             )
         
-        # The key fix for the character display issue
         char_add_btn.click(
             add_character,
             inputs=[char_name, char_desc],
@@ -4388,8 +4425,7 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select a file to view",
                 choices=get_project_file_options(),
-                value="Select a file",
-                allow_custom_value=True
+                value="Select a file"
             ), list_project_files()
         
         refresh_files_btn.click(
