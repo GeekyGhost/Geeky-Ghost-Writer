@@ -20,7 +20,7 @@ A powerful book generation application that leverages Ollama's local LLMs to cre
 - **📚 Complete Book Generation**: Create entire books from a single prompt with chapter-by-chapter generation
 - **🧠 Local LLM Integration**: Powered by Ollama for private, local AI inference
 - **🖥️ User-friendly Interface**: Intuitive Gradio UI with tabs for different aspects of book creation
-- **📝 Project Management**: Create, save, and load book projects
+- **📝 Project Management**: Create, save, and load book projects with automatic UI synchronization
 - **🌐 World Building Tools**: Define and manage world elements for consistent storytelling
 - **👤 Character Management**: Create and track characters throughout your narrative
 - **✏️ Advanced Editing**: Edit individual chapters and perform find-and-replace across your book
