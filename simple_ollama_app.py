@@ -1,4 +1,4 @@
-"""Enhanced Ollama-based book generator with project management and advanced editing features"""
+"""Geeky Ghost Writer - An Ollama-based book generator with project management and advanced editing features"""
 import os
 import gradio as gr
 import time
@@ -11,6 +11,35 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime
 import uuid
+
+# Import export-related libraries (conditional imports to handle missing libraries gracefully)
+export_capabilities = {
+    "txt": True,
+    "pdf": False,
+    "epub": False,
+    "docx": False,
+    "markdown": True
+}
+
+try:
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    export_capabilities["pdf"] = True
+except ImportError:
+    pass
+
+try:
+    import ebooklib
+    from ebooklib import epub
+    export_capabilities["epub"] = True
+except ImportError:
+    pass
+
+try:
+    from docx import Document
+    export_capabilities["docx"] = True
+except ImportError:
+    pass
 
 # Create the base output directories
 os.makedirs("book_output", exist_ok=True)
@@ -246,6 +275,63 @@ def sanitize_folder_name(title):
     unique_id = str(uuid.uuid4())[:8]
     return f"{sanitized}_{unique_id}"
 
+def create_safe_dropdown(label, choices, default_index=0, allow_custom=True):
+    """
+    Create a dropdown with valid default values to avoid JS errors.
+    
+    Args:
+        label: Label for the dropdown
+        choices: List of choices
+        default_index: Index of default choice, -1 for no default
+        allow_custom: Whether to allow custom values
+    
+    Returns:
+        A gradio Dropdown component with safe defaults
+    """
+    if not choices:
+        choices = ["No options available"]
+    
+    # Set a valid default value - never use None with allow_custom_value=True
+    if default_index >= 0 and default_index < len(choices):
+        value = choices[default_index]
+    else:
+        # Use empty string instead of None for safety
+        value = ""
+        
+    return gr.Dropdown(
+        label=label,
+        choices=choices,
+        value=value,
+        allow_custom_value=allow_custom
+    )
+
+def scan_project_folders():
+    """Scan book_output directory and return a list of valid projects with full paths"""
+    projects = []
+    try:
+        for item in os.listdir("book_output"):
+            item_path = os.path.join("book_output", item)
+            if os.path.isdir(item_path):
+                # Check if this has a valid metadata file
+                metadata_path = os.path.join(item_path, "book_metadata.json")
+                if os.path.exists(metadata_path):
+                    try:
+                        with open(metadata_path, "r", encoding="utf-8") as f:
+                            metadata = json.load(f)
+                            title = metadata.get("title", os.path.basename(item_path))
+                            # Store title and full path directly
+                            projects.append((title, item_path))
+                    except:
+                        # If we can't read metadata, just use folder name
+                        projects.append((item, item_path))
+                else:
+                    # No metadata, use folder name
+                    projects.append((item, item_path))
+    except Exception as e:
+        print(f"Error scanning project folders: {e}")
+    
+    return projects
+
 def create_book_project(title, style_input="", target_audience=None, series_id=None):
     """Create a new book project with the given title"""
     global current_book_title, current_book_folder, current_book_data, current_book_id, current_series_id
@@ -359,106 +445,126 @@ def save_book_metadata():
         print(f"Error saving book metadata: {str(e)}")
         return False
 
-def load_book_project(project_path_or_id):
-    """Load an existing book project by path or ID"""
+def load_book_project(project_path_or_tuple):
+    """Load an existing book project by path"""
     global current_book_title, current_book_folder, current_book_data, current_book_id, current_series_id, current_outline
     
     try:
-        # Check if we're loading by ID or path
-        if os.path.exists(project_path_or_id) and os.path.isdir(project_path_or_id):
-            # Loading by path
-            project_path = project_path_or_id
-            
-            # Load metadata from file
-            metadata_path = os.path.join(project_path, "book_metadata.json")
-            if os.path.exists(metadata_path):
-                with open(metadata_path, "r", encoding="utf-8") as f:
-                    current_book_data = json.load(f)
-                
-                # Update current book info
-                current_book_title = current_book_data.get("title", "Untitled")
-                current_book_folder = project_path
-                current_book_id = current_book_data.get("id")
-                current_series_id = current_book_data.get("series_id")
-                
-                # Load outline if available
-                if current_book_data.get("chapters"):
-                    current_outline = current_book_data.get("chapters")
-                
-                msg = f"Loaded book project: '{current_book_title}'"
-                log_message(msg)
-                return msg
+        # Extract path from tuple if needed
+        if isinstance(project_path_or_tuple, tuple):
+            if len(project_path_or_tuple) > 1:
+                project_path = project_path_or_tuple[1]  # Take the path part
             else:
-                msg = f"No metadata found for project: {project_path}"
-                log_message(msg)
-                return msg
+                project_path = project_path_or_tuple[0]
         else:
-            # Loading by ID
-            book_id = project_path_or_id
+            project_path = project_path_or_tuple
             
-            with closing(sqlite3.connect('book_projects.db')) as conn:
-                with closing(conn.cursor()) as cursor:
-                    # Get project info
+        # Check if this is a valid directory
+        if not os.path.isdir(project_path):
+            msg = f"Project path not found: {project_path}"
+            log_message(msg)
+            return msg
+        
+        # Load metadata from file
+        metadata_path = os.path.join(project_path, "book_metadata.json")
+        if not os.path.exists(metadata_path):
+            msg = f"No metadata found in: {project_path}"
+            log_message(msg)
+            return msg
+            
+        # Read the metadata
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            current_book_data = json.load(f)
+        
+        # Update current book info
+        current_book_title = current_book_data.get("title", os.path.basename(project_path))
+        current_book_folder = project_path
+        current_book_id = current_book_data.get("id")
+        if not current_book_id:
+            # Generate an ID if none exists
+            current_book_id = str(uuid.uuid4())
+            current_book_data["id"] = current_book_id
+            # Save the updated metadata with the new ID
+            with open(metadata_path, "w", encoding="utf-8") as f:
+                json.dump(current_book_data, f, indent=2)
+                
+        current_series_id = current_book_data.get("series_id")
+        
+        # Load outline if available
+        if current_book_data.get("chapters"):
+            current_outline = current_book_data.get("chapters")
+        
+        # Sync with database - update or insert
+        with closing(sqlite3.connect('book_projects.db')) as conn:
+            with closing(conn.cursor()) as cursor:
+                # Check if this ID already exists
+                cursor.execute("SELECT id FROM projects WHERE id = ?", (current_book_id,))
+                existing = cursor.fetchone()
+                
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                created_at = current_book_data.get("created_at", timestamp)
+                style = current_book_data.get("style", "")
+                
+                if existing:
+                    # Update existing record
                     cursor.execute(
-                        "SELECT id, title, folder_path, series_id FROM projects WHERE id = ?",
-                        (book_id,)
+                        """
+                        UPDATE projects SET 
+                        title = ?, 
+                        last_modified = ?,
+                        folder_path = ?
+                        WHERE id = ?
+                        """,
+                        (current_book_title, timestamp, project_path, current_book_id)
                     )
-                    project_info = cursor.fetchone()
-                    
-                    if not project_info:
-                        msg = f"No project found with ID: {book_id}"
-                        log_message(msg)
-                        return msg
-                    
-                    book_id, title, folder_path, series_id = project_info
-                    
-                    # Now load from the folder path
-                    return load_book_project(folder_path)
-    
+                else:
+                    # Insert new record
+                    cursor.execute(
+                        """
+                        INSERT INTO projects 
+                        (id, title, creation_date, last_modified, style, series_id, folder_path) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (current_book_id, current_book_title, created_at, timestamp, 
+                         style, current_series_id, project_path)
+                    )
+                
+                conn.commit()
+        
+        msg = f"Loaded book project: '{current_book_title}' from {project_path}"
+        log_message(msg)
+        return msg
+        
     except Exception as e:
         error_msg = f"Error loading book project: {str(e)}"
         log_message(error_msg)
         return error_msg
 
 def get_existing_projects():
-    """Get list of existing book projects from the database"""
+    """Get list of existing book projects primarily by scanning folders"""
+    # Directly scan folders first - more reliable than database
+    folder_projects = scan_project_folders()
+    
+    # Also check database as a fallback
     try:
-        projects = []
-        
-        # First check database
+        db_projects = []
         with closing(sqlite3.connect('book_projects.db')) as conn:
             with closing(conn.cursor()) as cursor:
                 cursor.execute(
                     "SELECT id, title, folder_path FROM projects ORDER BY last_modified DESC"
                 )
-                db_projects = cursor.fetchall()
-                
-                for project_id, title, folder_path in db_projects:
-                    if os.path.exists(folder_path):
-                        projects.append((title, project_id))
+                for project_id, title, folder_path in cursor.fetchall():
+                    # Only add if the folder actually exists
+                    if os.path.exists(folder_path) and os.path.isdir(folder_path):
+                        # Check if this path is already in our results
+                        if not any(folder_path == path for _, path in folder_projects):
+                            db_projects.append((title, folder_path))
         
-        # If database has no entries, fall back to file system
-        if not projects:
-            for item in os.listdir("book_output"):
-                item_path = os.path.join("book_output", item)
-                if os.path.isdir(item_path):
-                    metadata_path = os.path.join(item_path, "book_metadata.json")
-                    if os.path.exists(metadata_path):
-                        try:
-                            with open(metadata_path, "r", encoding="utf-8") as f:
-                                metadata = json.load(f)
-                                title = metadata.get("title", "Untitled")
-                                book_id = metadata.get("id", item_path)
-                                projects.append((title, book_id))
-                        except:
-                            projects.append((item, item_path))
-                    else:
-                        projects.append((item, item_path))
-        
-        return projects
+        # Combine both lists, with folder_projects taking precedence
+        return folder_projects + db_projects
     except Exception as e:
-        print(f"Error getting existing projects: {str(e)}")
-        return []
+        print(f"Database lookup failed, using folder scan only: {e}")
+        return folder_projects
 
 def create_series(series_name, description):
     """Create a new book series"""
@@ -546,7 +652,7 @@ def get_existing_series():
         
         return series_list
     except Exception as e:
-        print(f"Error getting existing series: {str(e)}")
+        print(f"Error getting existing series: {e}")
         return []
 
 def add_book_to_series(series_id, book_id):
@@ -2668,14 +2774,203 @@ def export_book_project(format_type="txt"):
         if not os.path.exists(full_book_path):
             combine_book()
         
-        # For now, we only support TXT format
-        # In the future, we could add PDF, EPUB, etc.
+        # Create a sanitized filename for the exported book
+        export_filename = sanitize_folder_name(current_book_title).replace("_", " ")
+        
+        # Read the combined book content
+        with open(full_book_path, "r", encoding="utf-8") as f:
+            book_content = f.read()
+        
+        # Process based on format type
         if format_type == "txt":
-            export_path = os.path.join(current_book_folder, f"{sanitize_folder_name(current_book_title)}.txt")
-            shutil.copy2(full_book_path, export_path)
+            # Plain text export
+            export_path = os.path.join(current_book_folder, f"{export_filename}.txt")
+            with open(export_path, "w", encoding="utf-8") as f:
+                f.write(book_content)
             return log_message(f"✓ Book exported as text file: {export_path}")
+        
+        elif format_type == "markdown":
+            # Markdown export (already in markdown format)
+            export_path = os.path.join(current_book_folder, f"{export_filename}.md")
+            with open(export_path, "w", encoding="utf-8") as f:
+                f.write(book_content)
+            return log_message(f"✓ Book exported as Markdown file: {export_path}")
+        
+        elif format_type == "pdf" and export_capabilities["pdf"]:
+            # PDF export using reportlab
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import letter
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet
+            
+            export_path = os.path.join(current_book_folder, f"{export_filename}.pdf")
+            
+            # Parse the book content to extract chapters and text
+            doc = SimpleDocTemplate(export_path, pagesize=letter)
+            styles = getSampleStyleSheet()
+            
+            # Process the content
+            story = []
+            
+            # Add the title
+            title = current_book_title
+            story.append(Paragraph(title, styles["Title"]))
+            story.append(Spacer(1, 12))
+            
+            # Process each chapter
+            chapter_pattern = re.compile(r"Chapter \d+: (.+?)(?=\n\n)")
+            chapters = chapter_pattern.findall(book_content)
+            content_parts = re.split(r"Chapter \d+: .+?\n\n", book_content)[1:]  # Skip the first part (book title)
+            
+            for i, (chapter_title, content) in enumerate(zip(chapters, content_parts), 1):
+                # Add chapter heading
+                story.append(Paragraph(f"Chapter {i}: {chapter_title}", styles["Heading1"]))
+                story.append(Spacer(1, 12))
+                
+                # Add chapter content - split by paragraphs
+                paragraphs = content.split("\n\n")
+                for para in paragraphs:
+                    if para.strip():
+                        story.append(Paragraph(para, styles["Normal"]))
+                        story.append(Spacer(1, 6))
+                
+                # Add page break between chapters
+                if i < len(chapters):
+                    story.append(Spacer(1, 12))
+            
+            # Build the PDF
+            doc.build(story)
+            
+            return log_message(f"✓ Book exported as PDF file: {export_path}")
+        
+        elif format_type == "epub" and export_capabilities["epub"]:
+            # EPUB export
+            import ebooklib
+            from ebooklib import epub
+            
+            export_path = os.path.join(current_book_folder, f"{export_filename}.epub")
+            
+            # Create a new EPUB book
+            book = epub.EpubBook()
+            
+            # Set metadata
+            book.set_identifier(f"ghostwriter-{current_book_id}")
+            book.set_title(current_book_title)
+            book.set_language('en')
+            
+            # Process the content
+            chapter_pattern = re.compile(r"Chapter (\d+): (.+?)(?=\n\n)")
+            matches = chapter_pattern.finditer(book_content)
+            content_parts = re.split(r"Chapter \d+: .+?\n\n", book_content)[1:]  # Skip the first part (book title)
+            
+            chapters = []
+            toc = []
+            
+            for i, (match, content) in enumerate(zip(matches, content_parts), 1):
+                chapter_num = match.group(1)
+                chapter_title = match.group(2)
+                
+                # Create chapter
+                c = epub.EpubHtml(title=f"Chapter {chapter_num}: {chapter_title}", 
+                                 file_name=f'chap_{chapter_num}.xhtml',
+                                 lang='en')
+                
+                # Format content as HTML
+                html_content = f"<h1>Chapter {chapter_num}: {chapter_title}</h1>"
+                
+                # Add paragraphs
+                paragraphs = content.split("\n\n")
+                for para in paragraphs:
+                    if para.strip():
+                        html_content += f"<p>{para}</p>"
+                
+                c.content = html_content
+                book.add_item(c)
+                chapters.append(c)
+                toc.append(epub.Link(f'chap_{chapter_num}.xhtml', f'Chapter {chapter_num}: {chapter_title}', f'chap_{chapter_num}'))
+            
+            # Add chapters to the book
+            book.toc = toc
+            
+            # Add default NCX and Nav files
+            book.add_item(epub.EpubNcx())
+            book.add_item(epub.EpubNav())
+            
+            # Define CSS
+            style = '''
+            @namespace epub "http://www.idpf.org/2007/ops";
+            body {
+                font-family: Cambria, Liberation Serif, Bitstream Vera Serif, Georgia, Times, Times New Roman, serif;
+            }
+            h1 {
+                text-align: center;
+                margin-bottom: 1em;
+            }
+            p {
+                text-indent: 1em;
+                margin-top: 0.5em;
+                margin-bottom: 0.5em;
+            }
+            '''
+            
+            nav_css = epub.EpubItem(uid="style_nav", file_name="style/nav.css", media_type="text/css", content=style)
+            book.add_item(nav_css)
+            
+            # Create spine
+            book.spine = ['nav'] + chapters
+            
+            # Write the EPUB file
+            epub.write_epub(export_path, book, {})
+            
+            return log_message(f"✓ Book exported as EPUB file: {export_path}")
+        
+        elif format_type == "docx" and export_capabilities["docx"]:
+            # DOCX export
+            from docx import Document
+            
+            export_path = os.path.join(current_book_folder, f"{export_filename}.docx")
+            
+            # Create a new Document
+            doc = Document()
+            
+            # Add title
+            doc.add_heading(current_book_title, 0)
+            
+            # Process the content
+            chapter_pattern = re.compile(r"Chapter (\d+): (.+?)(?=\n\n)")
+            matches = chapter_pattern.finditer(book_content)
+            content_parts = re.split(r"Chapter \d+: .+?\n\n", book_content)[1:]  # Skip the first part (book title)
+            
+            for i, (match, content) in enumerate(zip(matches, content_parts), 1):
+                chapter_num = match.group(1)
+                chapter_title = match.group(2)
+                
+                # Add chapter heading
+                doc.add_heading(f"Chapter {chapter_num}: {chapter_title}", 1)
+                
+                # Add paragraphs
+                paragraphs = content.split("\n\n")
+                for para in paragraphs:
+                    if para.strip():
+                        doc.add_paragraph(para)
+            
+            # Save the document
+            doc.save(export_path)
+            
+            return log_message(f"✓ Book exported as DOCX file: {export_path}")
+        
         else:
-            return log_message(f"Export format '{format_type}' not supported yet.")
+            if format_type not in ["txt", "markdown", "pdf", "epub", "docx"]:
+                return log_message(f"Export format '{format_type}' not supported.")
+            else:
+                # Format is supported but library is not available
+                missing_lib = {
+                    "pdf": "reportlab",
+                    "epub": "ebooklib",
+                    "docx": "python-docx"
+                }.get(format_type)
+                
+                return log_message(f"Export to {format_type} requires the {missing_lib} library. Please install it with pip.")
     
     except Exception as e:
         error_msg = f"Error exporting book: {str(e)}"
@@ -2768,8 +3063,8 @@ def get_current_book_info():
 # Create the Gradio interface
 def create_gradio_interface():
     """Create and return the Gradio interface"""
-    with gr.Blocks(title="Enhanced Ollama Book Generator", theme=gr.themes.Soft()) as app:
-        gr.Markdown("# 📚 Enhanced Ollama Book Generator")
+    with gr.Blocks(title="Geeky Ghost Writer", theme=gr.themes.Soft()) as app:
+        gr.Markdown("# 👻 Geeky Ghost Writer")
         gr.Markdown("""This application uses Ollama to generate books based on your prompts. 
                     Make sure Ollama is running before using this application.""")
         
@@ -2795,7 +3090,8 @@ def create_gradio_interface():
                     series_dropdown = gr.Dropdown(
                         label="Add to Series (Optional)",
                         choices=[("No Series", "")] + get_existing_series(),
-                        value="No Series"
+                        value="No Series",
+                        allow_custom_value=True
                     )
                     
                     create_btn = gr.Button("Create New Book Project", variant="primary")
@@ -2828,7 +3124,8 @@ def create_gradio_interface():
                     project_dropdown = gr.Dropdown(
                         label="Select a project to load",
                         choices=[("Select a project", "")] + get_existing_projects(),
-                        value="Select a project"
+                        value="Select a project",
+                        allow_custom_value=True
                     )
                     
                     load_btn = gr.Button("Load Selected Project")
@@ -2844,7 +3141,8 @@ def create_gradio_interface():
                         add_to_series_dropdown = gr.Dropdown(
                             label="Select Series",
                             choices=[("Select a series", "")] + get_existing_series(),
-                            value="Select a series"
+                            value="Select a series",
+                            allow_custom_value=True
                         )
                         add_to_series_btn = gr.Button("Add to Selected Series", variant="primary")
         
@@ -2875,7 +3173,8 @@ def create_gradio_interface():
                     reading_level_input = gr.Dropdown(
                         label="Reading Level",
                         choices=["Early Reader", "Children", "Middle Grade", "Young Adult", "Adult", "General"],
-                        value="General"
+                        value="General",
+                        allow_custom_value=True
                     )
                     
                     set_audience_btn = gr.Button("Set Age Range & Reading Level", variant="primary")
@@ -2889,7 +3188,8 @@ def create_gradio_interface():
                             "ADHD", "Autism", "Dyslexia", "Language Processing", 
                             "Visual Processing", "Sensory Sensitivity", "Other"
                         ],
-                        value="ADHD"
+                        value="ADHD",
+                        allow_custom_value=True
                     )
                     
                     accom_desc_input = gr.Textbox(
@@ -2940,7 +3240,8 @@ def create_gradio_interface():
                         wb_select = gr.Dropdown(
                             label="Select Element",
                             choices=get_world_building_categories(),
-                            value="Select a category"
+                            value="Select a category",
+                            allow_custom_value=True
                         )
                         
                         # Get content button
@@ -3011,19 +3312,22 @@ def create_gradio_interface():
                         wb_hier_category_select = gr.Dropdown(
                             label="Select Category",
                             choices=get_world_building_hierarchy_categories(),
-                            value="Select a category"
+                            value="Select a category",
+                            allow_custom_value=True
                         )
                         
                         wb_hier_subcategory_select = gr.Dropdown(
                             label="Select Subcategory",
                             choices=["Select a category first"],
-                            value="Select a category first"
+                            value="Select a category first",
+                            allow_custom_value=True
                         )
                         
                         wb_hier_element_select = gr.Dropdown(
                             label="Select Element",
                             choices=["Select a subcategory first"],
-                            value="Select a subcategory first"
+                            value="Select a subcategory first",
+                            allow_custom_value=True
                         )
                         
                         # Get element content button
@@ -3066,7 +3370,8 @@ def create_gradio_interface():
                         char_select = gr.Dropdown(
                             label="Select Character",
                             choices=get_character_names(),
-                            value="Select a character"
+                            value="Select a character",
+                            allow_custom_value=True
                         )
                         
                         # Get character button
@@ -3096,13 +3401,15 @@ def create_gradio_interface():
                         char1_select = gr.Dropdown(
                             label="Character 1",
                             choices=get_character_names(),
-                            value="Select a character"
+                            value="Select a character",
+                            allow_custom_value=True
                         )
                         
                         char2_select = gr.Dropdown(
                             label="Character 2",
                             choices=get_character_names(),
-                            value="Select a character"
+                            value="Select a character",
+                            allow_custom_value=True
                         )
                         
                         relationship_type = gr.Dropdown(
@@ -3111,7 +3418,8 @@ def create_gradio_interface():
                                 "Family", "Friends", "Allies", "Rivals", "Enemies", 
                                 "Lovers", "Teacher/Student", "Employer/Employee", "Other"
                             ],
-                            value="Friends"
+                            value="Friends",
+                            allow_custom_value=True
                         )
                         
                         relationship_desc = gr.Textbox(
@@ -3135,7 +3443,8 @@ def create_gradio_interface():
                         arc_char_select = gr.Dropdown(
                             label="Select Character",
                             choices=get_character_names(),
-                            value="Select a character"
+                            value="Select a character",
+                            allow_custom_value=True
                         )
                         
                         arc_points = gr.Textbox(
@@ -3208,7 +3517,8 @@ def create_gradio_interface():
                         models_dropdown = gr.Dropdown(
                             label="Ollama Model",
                             choices=get_ollama_models(),
-                            value="mistral"
+                            value="mistral",
+                            allow_custom_value=True
                         )
                     
                     with gr.Row():
@@ -3302,16 +3612,42 @@ def create_gradio_interface():
                     project_files_dropdown = gr.Dropdown(
                         label="Select a file to view",
                         choices=get_project_file_options(),
-                        value="Select a file"
+                        value="Select a file",
+                        allow_custom_value=True
                     )
                     
                     # Export options
                     gr.Markdown("### Export Options")
+                    
+                    # Create a list of available export formats
+                    available_formats = ["txt", "markdown"]
+                    if export_capabilities["pdf"]:
+                        available_formats.append("pdf")
+                    if export_capabilities["epub"]:
+                        available_formats.append("epub")
+                    if export_capabilities["docx"]:
+                        available_formats.append("docx")
+                    
                     export_format = gr.Dropdown(
                         label="Export Format",
-                        choices=["txt"],
-                        value="txt"
+                        choices=available_formats,
+                        value="txt",
+                        allow_custom_value=True
                     )
+                    
+                    # Show library information for missing formats
+                    if not all(export_capabilities.values()):
+                        missing_libs = []
+                        if not export_capabilities["pdf"]:
+                            missing_libs.append("reportlab (for PDF export)")
+                        if not export_capabilities["epub"]:
+                            missing_libs.append("ebooklib (for EPUB export)")
+                        if not export_capabilities["docx"]:
+                            missing_libs.append("python-docx (for DOCX export)")
+                        
+                        if missing_libs:
+                            gr.Markdown(f"💡 Some export formats require additional libraries: {', '.join(missing_libs)}")
+                    
                     export_btn = gr.Button("Export Book", variant="primary")
                 
                 with gr.Column(scale=2):
@@ -3340,7 +3676,8 @@ def create_gradio_interface():
             lambda: gr.Dropdown(
                 label="Add to Series (Optional)",
                 choices=[("No Series", "")] + get_existing_series(),
-                value="No Series"
+                value="No Series",
+                allow_custom_value=True
             ),
             inputs=None,
             outputs=[series_dropdown]
@@ -3348,7 +3685,8 @@ def create_gradio_interface():
             lambda: gr.Dropdown(
                 label="Select Series",
                 choices=[("Select a series", "")] + get_existing_series(),
-                value="Select a series"
+                value="Select a series",
+                allow_custom_value=True
             ),
             inputs=None,
             outputs=[add_to_series_dropdown]
@@ -3367,7 +3705,7 @@ def create_gradio_interface():
         
         # Load project
         load_btn.click(
-            lambda path: load_book_project(path[1] if isinstance(path, tuple) else path) if path else "No project selected.",
+            lambda selection: load_book_project(selection) if selection else "No project selected.",
             inputs=[project_dropdown],
             outputs=[project_log]
         ).then(
@@ -3380,7 +3718,6 @@ def create_gradio_interface():
                 choices=[f"Chapter {i+1}" for i in range(len(current_outline))] if current_outline else [],
                 value=[]
             ),
-
             inputs=None,
             outputs=[chapter_selection]
         )
@@ -3390,7 +3727,8 @@ def create_gradio_interface():
             fn=lambda: gr.Dropdown(
                 label="Select a project to load",
                 choices=[("Select a project", "")] + get_existing_projects(),
-                value="Select a project"
+                value="Select a project",
+                allow_custom_value=True
             ),
             inputs=None,
             outputs=[project_dropdown]
@@ -3432,7 +3770,8 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select Element",
                 choices=get_world_building_categories(),
-                value="Select a category"
+                value="Select a category",
+                allow_custom_value=True
             )
         
         wb_add_btn.click(
@@ -3491,7 +3830,8 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select Category",
                 choices=get_world_building_hierarchy_categories(),
-                value="Select a category"
+                value="Select a category",
+                allow_custom_value=True
             )
         
         def update_subcategory_dropdown(category):
@@ -3499,13 +3839,15 @@ def create_gradio_interface():
                 return gr.Dropdown(
                     label="Select Subcategory",
                     choices=get_world_building_subcategories(category),
-                    value="Select a subcategory"
+                    value="Select a subcategory",
+                    allow_custom_value=True
                 )
             else:
                 return gr.Dropdown(
                     label="Select Subcategory",
                     choices=["Select a category first"],
-                    value="Select a category first"
+                    value="Select a category first",
+                    allow_custom_value=True
                 )
         
         def update_element_dropdown(category, subcategory):
@@ -3513,13 +3855,15 @@ def create_gradio_interface():
                 return gr.Dropdown(
                     label="Select Element",
                     choices=get_world_building_elements(category, subcategory),
-                    value="Select an element"
+                    value="Select an element",
+                    allow_custom_value=True
                 )
             else:
                 return gr.Dropdown(
                     label="Select Element",
                     choices=["Select a subcategory first"],
-                    value="Select a subcategory first"
+                    value="Select a subcategory first",
+                    allow_custom_value=True
                 )
         
         wb_hier_add_btn.click(
@@ -3561,7 +3905,8 @@ def create_gradio_interface():
             lambda: gr.Dropdown(
                 label="Select Element",
                 choices=["Select a subcategory first"],
-                value="Select a subcategory first"
+                value="Select a subcategory first",
+                allow_custom_value=True
             ),
             inputs=None,
             outputs=[wb_hier_element_select]
@@ -3618,7 +3963,8 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select Character",
                 choices=get_character_names(),
-                value="Select a character"
+                value="Select a character",
+                allow_custom_value=True
             )
         
         # The key fix for the character display issue
@@ -3868,10 +4214,9 @@ def create_gradio_interface():
         ).then(
             lambda: gr.CheckboxGroup(
                 label="Select Chapters to Generate",
-                choices=[f"Chapter {i+1}" for i in range(len(current_outline))]   if current_outline else [],
+                choices=[f"Chapter {i+1}" for i in range(len(current_outline))] if current_outline else [],
                 value=[]
             ),
-
             inputs=None,
             outputs=[chapter_selection]
         )
@@ -4043,7 +4388,8 @@ def create_gradio_interface():
             return gr.Dropdown(
                 label="Select a file to view",
                 choices=get_project_file_options(),
-                value="Select a file"
+                value="Select a file",
+                allow_custom_value=True
             ), list_project_files()
         
         refresh_files_btn.click(
@@ -4093,7 +4439,7 @@ initialize_database()
 # Main entry point
 if __name__ == "__main__":
     # Display startup message
-    print("Starting Enhanced Ollama Book Generator...")
+    print("Starting Geeky Ghost Writer...")
     print("Make sure Ollama is running on http://localhost:11434")
     
     # Create and launch the app
