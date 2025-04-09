@@ -52,11 +52,10 @@ if %ERRORLEVEL% NEQ 0 (
 REM Install required packages
 echo Installing required packages...
 pip install gradio>=4.0.0 requests>=2.25.0 markdown>=3.3.0 pyyaml>=6.0
-if %ERRORLEVEL% NEQ 0 (
-    echo Failed to install required packages.
-    pause
-    exit /b 1
-)
+
+REM Install optional packages for export formats
+echo Installing optional packages for export formats...
+pip install reportlab ebooklib python-docx
 
 REM Run the application
 echo Starting the Enhanced Ollama Book Generator...
