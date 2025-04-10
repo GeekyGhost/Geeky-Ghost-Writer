@@ -240,14 +240,18 @@ def get_ollama_models():
         print(f"Error getting Ollama models: {e}")
         return ["mistral", "llama2"]  # Default models if request fails
 
-def generate_text(model, prompt):
-    """Generate text using Ollama API directly"""
+def generate_text(model, prompt, num_ctx=None):
+    """Generate text using Ollama API directly with optional context window size"""
     try:
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": False
         }
+        
+        # Add num_ctx parameter if provided to increase context window
+        if num_ctx:
+            payload["options"] = {"num_ctx": num_ctx}
         
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -363,7 +367,16 @@ def create_book_project(title, style_input="", target_audience=None, series_id=N
         current_book_title = title
         current_book_folder = book_folder
         current_book_id = book_id
-        current_series_id = series_id
+        
+        # Handle series_id if it's a tuple
+        if isinstance(series_id, tuple) and len(series_id) > 1:
+            current_series_id = series_id[1]  # Extract the ID part
+        else:
+            current_series_id = series_id
+        
+        # Ensure target_audience is a dictionary
+        if target_audience is None or not isinstance(target_audience, dict):
+            target_audience = {}
         
         # Initialize book data structure
         current_book_data = {
@@ -371,9 +384,9 @@ def create_book_project(title, style_input="", target_audience=None, series_id=N
             "title": title,
             "folder": book_folder,
             "created_at": timestamp,
-            "series_id": series_id,
+            "series_id": current_series_id,
             "style": style_input,
-            "target_audience": target_audience or {},
+            "target_audience": target_audience,
             "world_building": {},
             "world_building_hierarchy": {},
             "characters": {},
@@ -738,7 +751,7 @@ def add_book_to_series(series_id, book_id):
         return error_msg
 
 def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
-    """Generate a book outline"""
+    """Generate a book outline in batches to handle larger chapter counts"""
     global current_outline, current_book_data
     
     # Check if we have an active book project
@@ -756,6 +769,12 @@ def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
         if style_input:
             style_prompt = f"\nThe writing style should be: {style_input}\n"
             current_book_data["style"] = style_input
+        
+        # Ensure the prompt explicitly focuses on the book topic
+        focused_prompt = initial_prompt
+        if current_book_title and current_book_title.lower() not in initial_prompt.lower():
+            focused_prompt = f"A book about {current_book_title}: {initial_prompt}"
+            log_message(f"Enhancing prompt with book title for focus: '{focused_prompt}'")
         
         # Add world building info if available
         world_building_prompt = ""
@@ -827,54 +846,67 @@ def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
                 for guideline in audience["content_guidelines"]:
                     target_audience_prompt += f"  - {guideline}\n"
         
-        # Generate a story outline using the model
-        outline_prompt = f"""
-        Generate a detailed {num_chapters}-chapter outline for a book based on this premise:
+        # Process chapters in batches to avoid context window limitations
+        batch_size = 10  # Process 10 chapters at a time
+        all_chapters = []
         
-        {initial_prompt}
-        {style_prompt}
-        {world_building_prompt}
-        {character_prompt}
-        {target_audience_prompt}
+        for batch_start in range(0, num_chapters, batch_size):
+            batch_end = min(batch_start + batch_size, num_chapters)
+            log_message(f"Generating outline batch for chapters {batch_start+1} to {batch_end}...")
+            
+            # Create a batch-specific prompt
+            batch_prompt = f"""
+            Generate a detailed outline for chapters {batch_start+1} to {batch_end} of a book based on this premise:
+            
+            {initial_prompt}
+            {style_prompt}
+            {world_building_prompt}
+            {character_prompt}
+            {target_audience_prompt}
+            
+            For each chapter, provide the following information in this exact format:
+            
+            Chapter [Number]: [Title]
+            Key Events:
+            - [Event 1]
+            - [Event 2]
+            - [Event 3]
+            Character Developments: [Brief description of character developments]
+            Setting: [Brief description of the setting]
+            Tone: [Brief description of the emotional tone]
+            
+            Make sure each chapter has a unique title and at least 3 key events.
+            Start your response with "OUTLINE:" and end with "END OF OUTLINE"
+            """
+            
+            # Use a larger context window for Ollama (8192 is a good balance)
+            outline_text = generate_text(model_name, batch_prompt, num_ctx=8192)
+            
+            # Process the batch outline
+            batch_chapters = process_outline(outline_text, batch_end - batch_start)
+            
+            # Adjust chapter numbers
+            for i, chapter in enumerate(batch_chapters, batch_start + 1):
+                chapter["chapter_number"] = i
+            
+            # Add to our collection
+            all_chapters.extend(batch_chapters)
         
-        For each chapter, provide the following information in this exact format:
-        
-        Chapter 1: [Title]
-        Key Events:
-        - [Event 1]
-        - [Event 2]
-        - [Event 3]
-        Character Developments: [Brief description of character developments]
-        Setting: [Brief description of the setting]
-        Tone: [Brief description of the emotional tone]
-        
-        [Repeat the above format for each chapter]
-        
-        Make sure each chapter has a unique title and at least 3 key events.
-        Start your response with "OUTLINE:" and end with "END OF OUTLINE"
-        """
-        
-        # Get response from Ollama using the API
-        outline_text = generate_text(model_name, outline_prompt)
-        
-        # Process the outline into a structured format
-        chapters = process_outline(outline_text, num_chapters)
-        current_outline = chapters
-        
-        # Update book data
-        current_book_data["chapters"] = chapters
+        # Set the complete outline
+        current_outline = all_chapters
+        current_book_data["chapters"] = all_chapters
         save_book_metadata()
         
         # Format the outline for display
         formatted_outline = "# Generated Book Outline\n\n"
-        for chapter in chapters:
+        for chapter in all_chapters:
             formatted_outline += f"## Chapter {chapter['chapter_number']}: {chapter['title']}\n"
             formatted_outline += f"{chapter['prompt']}\n\n"
         
         # Save the outline to file
         outline_path = os.path.join(current_book_folder, "outline.txt")
         with open(outline_path, "w") as f:
-            for chapter in chapters:
+            for chapter in all_chapters:
                 f.write(f"\nChapter {chapter['chapter_number']}: {chapter['title']}\n")
                 f.write("-" * 50 + "\n")
                 f.write(chapter['prompt'] + "\n")
@@ -882,7 +914,7 @@ def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
         # Save to database as well
         with closing(sqlite3.connect('book_projects.db')) as conn:
             with closing(conn.cursor()) as cursor:
-                for chapter in chapters:
+                for chapter in all_chapters:
                     # Generate unique ID for the chapter
                     chapter_id = str(uuid.uuid4())
                     
@@ -995,6 +1027,122 @@ def process_outline(outline_text, num_chapters):
     
     return chapters
 
+def revise_chapter_outline(chapter_number, revision_prompt, model_name):
+    """Revise a specific chapter outline based on user feedback"""
+    global current_outline, current_book_data
+    
+    try:
+        if not current_book_folder:
+            msg = "No active book project. Please create or load a book project first."
+            log_message(msg)
+            return "", msg
+        
+        if not current_outline:
+            msg = "No outline available. Please generate an outline first."
+            log_message(msg)
+            return "", msg
+        
+        # Find the chapter to revise
+        chapter_to_revise = None
+        for chapter in current_outline:
+            if chapter["chapter_number"] == chapter_number:
+                chapter_to_revise = chapter
+                break
+        
+        if not chapter_to_revise:
+            msg = f"Chapter {chapter_number} not found in the outline."
+            log_message(msg)
+            return "", msg
+        
+        # Create the revision prompt
+        revision_prompt_full = f"""
+        Revise the following chapter outline based on this feedback: "{revision_prompt}"
+        
+        Current outline for Chapter {chapter_number}: {chapter_to_revise['title']}
+        {chapter_to_revise['prompt']}
+        
+        Provide a revised outline in the following format:
+        
+        Chapter {chapter_number}: [New Title if needed, or keep the existing title]
+        Key Events:
+        - [Event 1]
+        - [Event 2]
+        - [Event 3]
+        Character Developments: [Brief description of character developments]
+        Setting: [Brief description of the setting]
+        Tone: [Brief description of the emotional tone]
+        
+        Start your response with "REVISED OUTLINE:" and end with "END OF REVISION"
+        """
+        
+        # Generate the revised outline
+        revised_text = generate_text(model_name, revision_prompt_full, num_ctx=4096)
+        
+        # Extract the revised outline
+        if "REVISED OUTLINE:" in revised_text:
+            start_idx = revised_text.find("REVISED OUTLINE:")
+            end_idx = revised_text.find("END OF REVISION")
+            if end_idx == -1:
+                end_idx = len(revised_text)
+            revised_content = revised_text[start_idx:end_idx].strip()
+        else:
+            revised_content = revised_text
+        
+        # Extract just the content after "REVISED OUTLINE:" if present
+        if "REVISED OUTLINE:" in revised_content:
+            revised_content = revised_content.split("REVISED OUTLINE:")[1].strip()
+        
+        # Parse the revised chapter
+        chapter_line = ""
+        for line in revised_content.split('\n'):
+            if line.startswith(f"Chapter {chapter_number}:"):
+                chapter_line = line
+                break
+        
+        if chapter_line:
+            title = chapter_line.replace(f"Chapter {chapter_number}:", "").strip()
+        else:
+            title = chapter_to_revise['title']  # Keep existing title
+        
+        # Update the chapter
+        chapter_to_revise['title'] = title
+        chapter_to_revise['prompt'] = revised_content.replace(chapter_line, "").strip()
+        
+        # Update in the database
+        with closing(sqlite3.connect('book_projects.db')) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute(
+                    "UPDATE chapters SET title = ?, outline = ? WHERE project_id = ? AND chapter_number = ?",
+                    (title, chapter_to_revise['prompt'], current_book_id, chapter_number)
+                )
+                conn.commit()
+        
+        # Save the updated metadata
+        save_book_metadata()
+        
+        # Update the outline file
+        outline_path = os.path.join(current_book_folder, "outline.txt")
+        with open(outline_path, "w") as f:
+            for chapter in current_outline:
+                f.write(f"\nChapter {chapter['chapter_number']}: {chapter['title']}\n")
+                f.write("-" * 50 + "\n")
+                f.write(chapter['prompt'] + "\n")
+        
+        # Format the outline for display
+        formatted_outline = "# Generated Book Outline\n\n"
+        for chapter in current_outline:
+            formatted_outline += f"## Chapter {chapter['chapter_number']}: {chapter['title']}\n"
+            formatted_outline += f"{chapter['prompt']}\n\n"
+        
+        msg = f"✓ Chapter {chapter_number} outline revised successfully!"
+        log_message(msg)
+        return formatted_outline, msg
+    
+    except Exception as e:
+        error_msg = f"Error revising chapter outline: {str(e)}"
+        log_message(error_msg)
+        return "", error_msg
+
 def generate_chapter(chapter_number, chapter_info, model_name):
     """Generate a single chapter using Ollama"""
     try:
@@ -1101,8 +1249,8 @@ def generate_chapter(chapter_number, chapter_info, model_name):
         Just write the prose of the chapter.
         """
         
-        # Generate the chapter
-        chapter_content = generate_text(model_name, chapter_prompt)
+        # Generate the chapter with a larger context window
+        chapter_content = generate_text(model_name, chapter_prompt, num_ctx=8192)
         
         # Save the chapter
         save_path = os.path.join(current_book_folder, f"chapter_{chapter_number:02d}.txt")
@@ -3074,7 +3222,7 @@ def get_current_book_info():
 
 # Create the Gradio interface
 def create_gradio_interface():
-    """Create and return the Gradio interface"""
+    """Create and return the Gradio interface with outline revision capability"""
     with gr.Blocks(title="Geeky Ghost Writer", theme=gr.themes.Soft()) as app:
         gr.Markdown("# 👻 Geeky Ghost Writer")
         gr.Markdown("""This application uses Ollama to generate books based on your prompts. 
@@ -3534,6 +3682,31 @@ def create_gradio_interface():
                         )
                         
                         generate_selected_btn = gr.Button("Generate Selected Chapters", variant="primary")
+                    
+                    # Add outline revision section
+                    with gr.Accordion("Outline Revision", open=False):
+                        gr.Markdown(
+                            """
+                            ### Revise Specific Chapters
+                            Use this section to revise specific chapters of your outline.
+                            Provide feedback for how you want to change the chapter.
+                            """
+                        )
+                        
+                        chapter_to_revise = gr.Number(
+                            label="Chapter Number to Revise",
+                            value=1,
+                            minimum=1,
+                            step=1
+                        )
+                        
+                        revision_feedback = gr.Textbox(
+                            label="Revision Feedback",
+                            placeholder="Describe how you want to revise this chapter (e.g., 'Make it more action-oriented', 'Change the setting to a forest', etc.)",
+                            lines=3
+                        )
+                        
+                        revise_btn = gr.Button("Revise Chapter", variant="primary")
                 
                 with gr.Column(scale=3):
                     # Output section
@@ -4241,7 +4414,12 @@ def create_gradio_interface():
         
         # Book generation tab
         outline_btn.click(
-            generate_outline, 
+            lambda prompt, num_chapters, model, style: generate_outline(
+                f"A comprehensive book about {current_book_title}: {prompt}" if current_book_title and current_book_title.lower() not in prompt.lower() else prompt,
+                num_chapters, 
+                model, 
+                style
+            ),
             inputs=[prompt_input, chapters_input, models_dropdown, style_input],
             outputs=[outline_output, log_output]
         ).then(
@@ -4256,6 +4434,13 @@ def create_gradio_interface():
             ),
             inputs=None,
             outputs=[chapter_selection]
+        )
+        
+        # Add the event handler for chapter revision
+        revise_btn.click(
+            revise_chapter_outline,
+            inputs=[chapter_to_revise, revision_feedback, models_dropdown],
+            outputs=[outline_output, log_output]
         )
         
         # Progress update functions
