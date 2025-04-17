@@ -11,6 +11,19 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("ghostwriter.log", encoding='utf-8'),  # Add encoding='utf-8' here
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('GeekyGhostWriter')
 
 # Import export-related libraries (conditional imports to handle missing libraries gracefully)
 export_capabilities = {
@@ -79,6 +92,10 @@ generation_progress = {
     "start_time": None,
     "estimated_completion_time": None
 }
+
+# Ollama API configuration
+OLLAMA_BASE_URL = "http://localhost:11434/api"
+DEFAULT_CONTEXT_SIZE = 8192  # Increased from default 2048 for better performance with outlines
 
 # Database initialization
 def initialize_database():
@@ -202,26 +219,27 @@ def initialize_database():
                 conn.commit()
         return True
     except Exception as e:
-        print(f"Database initialization error: {str(e)}")
+        logger.error(f"Database initialization error: {str(e)}")
         return False
 
 def log_message(message):
     """Add a message to the log and return all messages"""
     log_messages.append(message)
+    logger.info(message)
     return "\n".join(log_messages)
 
 def check_ollama_running():
     """Check if Ollama is running by making a request to list models"""
     try:
-        response = requests.get("http://localhost:11434/api/tags")
+        response = requests.get(f"{OLLAMA_BASE_URL}/tags", timeout=5)
         return response.status_code == 200
-    except:
+    except Exception:
         return False
 
 def get_ollama_models():
     """Get list of available Ollama models"""
     try:
-        response = requests.get("http://localhost:11434/api/tags")
+        response = requests.get(f"{OLLAMA_BASE_URL}/tags", timeout=5)
         if response.status_code == 200:
             models_data = response.json()
             model_names = []
@@ -237,34 +255,96 @@ def get_ollama_models():
         else:
             return ["mistral", "llama2"]  # Default models if request fails
     except Exception as e:
-        print(f"Error getting Ollama models: {e}")
+        logger.error(f"Error getting Ollama models: {e}")
         return ["mistral", "llama2"]  # Default models if request fails
 
-def generate_text(model, prompt, num_ctx=None):
-    """Generate text using Ollama API directly with optional context window size"""
-    try:
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False
-        }
+def generate_text(model, prompt, num_ctx=DEFAULT_CONTEXT_SIZE, max_retries=3, timeout=60):
+    """
+    Generate text using Ollama API with retry logic and improved error handling
+    
+    Args:
+        model: The Ollama model to use
+        prompt: The prompt to send to the model
+        num_ctx: Context window size
+        max_retries: Maximum number of retries if request fails
+        timeout: Request timeout in seconds
         
-        # Add num_ctx parameter if provided to increase context window
-        if num_ctx:
-            payload["options"] = {"num_ctx": num_ctx}
+    Returns:
+        Generated text or error message
+    """
+    for retry in range(max_retries):
+        try:
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_ctx": num_ctx}
+            }
+            
+            logger.debug(f"Sending request to Ollama with {num_ctx} context window")
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/generate",
+                json=payload,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("response", "")
+            else:
+                error_msg = f"Error {response.status_code}: {response.text}"
+                logger.warning(f"Attempt {retry+1}/{max_retries}: {error_msg}")
+                
+                # If we're out of retries, return the error
+                if retry == max_retries - 1:
+                    return f"Error: {error_msg}"
+                
+                # Wait before retrying with backoff
+                time.sleep(2 ** retry)
+        except requests.exceptions.Timeout:
+            logger.warning(f"Attempt {retry+1}/{max_retries}: Request timed out after {timeout} seconds")
+            if retry == max_retries - 1:
+                return f"Error: Request timed out after {timeout} seconds"
+            time.sleep(2 ** retry)
+        except Exception as e:
+            logger.warning(f"Attempt {retry+1}/{max_retries}: Unexpected error: {str(e)}")
+            if retry == max_retries - 1:
+                return f"Error: {str(e)}"
+            time.sleep(2 ** retry)
+    
+    return "Error: Failed to generate text after multiple attempts"
+
+def generate_text_batch(model, prompts, num_ctx=DEFAULT_CONTEXT_SIZE, max_concurrent=3):
+    """
+    Generate text for multiple prompts concurrently using a thread pool
+    
+    Args:
+        model: The Ollama model to use
+        prompts: List of prompts to send to the model
+        num_ctx: Context window size
+        max_concurrent: Maximum number of concurrent requests
         
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json=payload
-        )
+    Returns:
+        List of generated texts
+    """
+    results = [None] * len(prompts)
+    
+    def process_prompt(args):
+        idx, prompt = args
+        result = generate_text(model, prompt, num_ctx)
+        return idx, result
+    
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        futures = [executor.submit(process_prompt, (i, prompt)) for i, prompt in enumerate(prompts)]
         
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("response", "")
-        else:
-            return f"Error: {response.status_code}"
-    except Exception as e:
-        return f"Error: {str(e)}"
+        for future in as_completed(futures):
+            try:
+                idx, result = future.result()
+                results[idx] = result
+            except Exception as e:
+                logger.error(f"Error in batch processing: {str(e)}")
+    
+    return results
 
 def sanitize_folder_name(title):
     """Convert title to a valid folder name with unique ID"""
@@ -344,7 +424,7 @@ def scan_project_folders():
                     # No metadata, use folder name
                     projects.append((item, item_path))
     except Exception as e:
-        print(f"Error scanning project folders: {e}")
+        logger.error(f"Error scanning project folders: {e}")
     
     return projects
 
@@ -436,13 +516,13 @@ def create_book_project(title, style_input="", target_audience=None, series_id=N
                 conn.commit()
         
         message = f"Created new book project: '{title}' in folder: {book_folder}"
-        log_message(message)
-        return message
+        logger.info(message)
+        return log_message(message)
     
     except Exception as e:
         error_msg = f"Error creating book project: {str(e)}"
-        log_message(error_msg)
-        return error_msg
+        logger.error(error_msg)
+        return log_message(error_msg)
 
 def save_book_metadata():
     """Save book metadata to a JSON file"""
@@ -467,7 +547,7 @@ def save_book_metadata():
         
         return True
     except Exception as e:
-        print(f"Error saving book metadata: {str(e)}")
+        logger.error(f"Error saving book metadata: {str(e)}")
         return False
 
 def load_book_project(project_path_or_tuple):
@@ -487,15 +567,15 @@ def load_book_project(project_path_or_tuple):
         # Check if this is a valid directory
         if not os.path.isdir(project_path):
             msg = f"Project path not found: {project_path}"
-            log_message(msg)
-            return msg
+            logger.warning(msg)
+            return log_message(msg)
         
         # Load metadata from file
         metadata_path = os.path.join(project_path, "book_metadata.json")
         if not os.path.exists(metadata_path):
             msg = f"No metadata found in: {project_path}"
-            log_message(msg)
-            return msg
+            logger.warning(msg)
+            return log_message(msg)
             
         # Read the metadata
         with open(metadata_path, "r", encoding="utf-8") as f:
@@ -557,13 +637,13 @@ def load_book_project(project_path_or_tuple):
                 conn.commit()
         
         msg = f"Loaded book project: '{current_book_title}' from {project_path}"
-        log_message(msg)
-        return msg
+        logger.info(msg)
+        return log_message(msg)
         
     except Exception as e:
         error_msg = f"Error loading book project: {str(e)}"
-        log_message(error_msg)
-        return error_msg
+        logger.error(error_msg)
+        return log_message(error_msg)
 
 def get_existing_projects():
     """Get list of existing book projects primarily by scanning folders"""
@@ -588,7 +668,7 @@ def get_existing_projects():
         # Combine both lists, with folder_projects taking precedence
         return folder_projects + db_projects
     except Exception as e:
-        print(f"Database lookup failed, using folder scan only: {e}")
+        logger.error(f"Database lookup failed, using folder scan only: {e}")
         return folder_projects
 
 def create_series(series_name, description):
@@ -633,12 +713,12 @@ def create_series(series_name, description):
                 conn.commit()
         
         message = f"Created new book series: '{series_name}' in folder: {series_folder}"
-        log_message(message)
+        logger.info(message)
         return message, series_id
     
     except Exception as e:
         error_msg = f"Error creating series: {str(e)}"
-        log_message(error_msg)
+        logger.error(error_msg)
         return error_msg, None
 
 def get_existing_series():
@@ -677,7 +757,7 @@ def get_existing_series():
         
         return series_list
     except Exception as e:
-        print(f"Error getting existing series: {e}")
+        logger.error(f"Error getting existing series: {e}")
         return []
 
 def add_book_to_series(series_id, book_id):
@@ -742,155 +822,229 @@ def add_book_to_series(series_id, book_id):
             save_book_metadata()
         
         message = f"Added book '{book_title}' to series '{series_name}'"
-        log_message(message)
-        return message
+        logger.info(message)
+        return log_message(message)
     
     except Exception as e:
         error_msg = f"Error adding book to series: {str(e)}"
-        log_message(error_msg)
-        return error_msg
+        logger.error(error_msg)
+        return log_message(error_msg)
+
+def build_outline_prompt(initial_prompt, chapter_range, style_input=""):
+    """
+    Build a comprehensive prompt for outline generation
+    
+    Args:
+        initial_prompt: The base prompt for the book idea
+        chapter_range: Tuple of (start_chapter, end_chapter)
+        style_input: Optional style information
+        
+    Returns:
+        A complete prompt with all context for the specified chapter range
+    """
+    start_chapter, end_chapter = chapter_range
+    
+    # Add style information if provided
+    style_prompt = ""
+    if style_input:
+        style_prompt = f"\nThe writing style should be: {style_input}\n"
+    
+    # Add world building info if available
+    world_building_prompt = ""
+    if current_book_data.get("world_building"):
+        world_building_prompt = "\nWorld building information:\n"
+        for key, value in current_book_data["world_building"].items():
+            world_building_prompt += f"- {key}: {value}\n"
+    
+    # Add hierarchical world building if available
+    if current_book_data.get("world_building_hierarchy"):
+        if not world_building_prompt:
+            world_building_prompt = "\nWorld building information:\n"
+        
+        for category, subcategories in current_book_data["world_building_hierarchy"].items():
+            world_building_prompt += f"- {category}:\n"
+            for subcategory, elements in subcategories.items():
+                world_building_prompt += f"  - {subcategory}:\n"
+                for name, content in elements.items():
+                    world_building_prompt += f"    - {name}: {content}\n"
+    
+    # Add character info if available
+    character_prompt = ""
+    if current_book_data.get("characters"):
+        character_prompt = "\nCharacter information:\n"
+        for name, info in current_book_data["characters"].items():
+            character_prompt += f"- {name}: {info}\n"
+    
+    # Add character relationships if available
+    if current_book_data.get("character_relationships"):
+        if not character_prompt:
+            character_prompt = "\nCharacter information:\n"
+        
+        character_prompt += "\nCharacter relationships:\n"
+        for rel in current_book_data["character_relationships"]:
+            character_prompt += f"- {rel['character1']} and {rel['character2']}: {rel['type']} - {rel['description']}\n"
+    
+    # Add character arcs if available
+    if current_book_data.get("character_arcs"):
+        if not character_prompt:
+            character_prompt = "\nCharacter information:\n"
+        
+        character_prompt += "\nCharacter arcs:\n"
+        for char, arc_points in current_book_data["character_arcs"].items():
+            character_prompt += f"- {char}'s arc: {arc_points}\n"
+    
+    # Add target audience info if available
+    target_audience_prompt = ""
+    if current_book_data.get("target_audience"):
+        audience = current_book_data["target_audience"]
+        target_audience_prompt = "\nTarget Audience Specifications:\n"
+        
+        # Age range
+        if "age_min" in audience and "age_max" in audience:
+            target_audience_prompt += f"- Age Range: {audience['age_min']}-{audience['age_max']} years\n"
+        
+        # Reading level
+        if "reading_level" in audience:
+            target_audience_prompt += f"- Reading Level: {audience['reading_level']}\n"
+        
+        # Neurodivergent accommodations
+        if "accommodations" in audience:
+            target_audience_prompt += "- Accommodations:\n"
+            for accom in audience["accommodations"]:
+                target_audience_prompt += f"  - {accom['type']}: {accom['description']}\n"
+        
+        # Content guidelines
+        if "content_guidelines" in audience:
+            target_audience_prompt += "- Content Guidelines:\n"
+            for guideline in audience["content_guidelines"]:
+                target_audience_prompt += f"  - {guideline}\n"
+    
+    # Create the batch-specific prompt
+    batch_prompt = f"""
+    Generate a detailed outline for chapters {start_chapter} to {end_chapter} of a book titled "{current_book_title}" based on this premise:
+    
+    {initial_prompt}
+    {style_prompt}
+    {world_building_prompt}
+    {character_prompt}
+    {target_audience_prompt}
+    
+    For each chapter, provide the following information in this exact format:
+    
+    Chapter [Number]: [Title]
+    Key Events:
+    - [Event 1]
+    - [Event 2]
+    - [Event 3]
+    Character Developments: [Brief description of character developments]
+    Setting: [Brief description of the setting]
+    Tone: [Brief description of the emotional tone]
+    
+    Make sure each chapter has a unique title and at least 3 key events.
+    Start your response with "OUTLINE:" and end with "END OF OUTLINE"
+    """
+    
+    return batch_prompt
 
 def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
-    """Generate a book outline in batches to handle larger chapter counts"""
+    """
+    Generate a book outline in batches with improved reliability
+    
+    Enhancements:
+    1. Uses parallel processing for improved performance
+    2. Implements better error handling
+    3. Uses optimal context window size
+    4. Processes chapters in smaller batches to avoid context limits
+    """
     global current_outline, current_book_data
     
     # Check if we have an active book project
     if not current_book_folder:
         msg = "No active book project. Please create or load a book project first."
-        log_message(msg)
-        return "", msg
+        logger.warning(msg)
+        return "", log_message(msg)
     
     log_message(f"Starting outline generation using {model_name} model...")
     log_message(f"Number of chapters: {num_chapters}")
     
     try:
-        # Add style information if provided
-        style_prompt = ""
+        # Update style in book data if provided
         if style_input:
-            style_prompt = f"\nThe writing style should be: {style_input}\n"
             current_book_data["style"] = style_input
         
-        # Ensure the prompt explicitly focuses on the book topic
+        # Add book title to prompt if not already present
         focused_prompt = initial_prompt
         if current_book_title and current_book_title.lower() not in initial_prompt.lower():
             focused_prompt = f"A book about {current_book_title}: {initial_prompt}"
             log_message(f"Enhancing prompt with book title for focus: '{focused_prompt}'")
         
-        # Add world building info if available
-        world_building_prompt = ""
-        if current_book_data.get("world_building"):
-            world_building_prompt = "\nWorld building information:\n"
-            for key, value in current_book_data["world_building"].items():
-                world_building_prompt += f"- {key}: {value}\n"
-        
-        # Add hierarchical world building if available
-        if current_book_data.get("world_building_hierarchy"):
-            if not world_building_prompt:
-                world_building_prompt = "\nWorld building information:\n"
-            
-            for category, subcategories in current_book_data["world_building_hierarchy"].items():
-                world_building_prompt += f"- {category}:\n"
-                for subcategory, elements in subcategories.items():
-                    world_building_prompt += f"  - {subcategory}:\n"
-                    for name, content in elements.items():
-                        world_building_prompt += f"    - {name}: {content}\n"
-        
-        # Add character info if available
-        character_prompt = ""
-        if current_book_data.get("characters"):
-            character_prompt = "\nCharacter information:\n"
-            for name, info in current_book_data["characters"].items():
-                character_prompt += f"- {name}: {info}\n"
-        
-        # Add character relationships if available
-        if current_book_data.get("character_relationships"):
-            if not character_prompt:
-                character_prompt = "\nCharacter information:\n"
-            
-            character_prompt += "\nCharacter relationships:\n"
-            for rel in current_book_data["character_relationships"]:
-                character_prompt += f"- {rel['character1']} and {rel['character2']}: {rel['type']} - {rel['description']}\n"
-        
-        # Add character arcs if available
-        if current_book_data.get("character_arcs"):
-            if not character_prompt:
-                character_prompt = "\nCharacter information:\n"
-            
-            character_prompt += "\nCharacter arcs:\n"
-            for char, arc_points in current_book_data["character_arcs"].items():
-                character_prompt += f"- {char}'s arc: {arc_points}\n"
-        
-        # Add target audience info if available
-        target_audience_prompt = ""
-        if current_book_data.get("target_audience"):
-            audience = current_book_data["target_audience"]
-            target_audience_prompt = "\nTarget Audience Specifications:\n"
-            
-            # Age range
-            if "age_min" in audience and "age_max" in audience:
-                target_audience_prompt += f"- Age Range: {audience['age_min']}-{audience['age_max']} years\n"
-            
-            # Reading level
-            if "reading_level" in audience:
-                target_audience_prompt += f"- Reading Level: {audience['reading_level']}\n"
-            
-            # Neurodivergent accommodations
-            if "accommodations" in audience:
-                target_audience_prompt += "- Accommodations:\n"
-                for accom in audience["accommodations"]:
-                    target_audience_prompt += f"  - {accom['type']}: {accom['description']}\n"
-            
-            # Content guidelines
-            if "content_guidelines" in audience:
-                target_audience_prompt += "- Content Guidelines:\n"
-                for guideline in audience["content_guidelines"]:
-                    target_audience_prompt += f"  - {guideline}\n"
-        
-        # Process chapters in batches to avoid context window limitations
-        batch_size = 10  # Process 10 chapters at a time
+        # Process chapters in smaller batches to avoid context window limitations
+        # A batch size of 5 chapters works well for most models
+        batch_size = 5
         all_chapters = []
         
-        for batch_start in range(0, num_chapters, batch_size):
-            batch_end = min(batch_start + batch_size, num_chapters)
-            log_message(f"Generating outline batch for chapters {batch_start+1} to {batch_end}...")
+        # Calculate how many batches we need
+        num_batches = (num_chapters + batch_size - 1) // batch_size  # Ceiling division
+        
+        # Create batch ranges
+        batch_ranges = []
+        for i in range(num_batches):
+            start_chapter = i * batch_size + 1
+            end_chapter = min((i + 1) * batch_size, num_chapters)
+            batch_ranges.append((start_chapter, end_chapter))
+        
+        log_message(f"Processing {num_chapters} chapters in {num_batches} batches...")
+        
+        # Prepare prompts for all batches
+        batch_prompts = [build_outline_prompt(focused_prompt, batch_range, style_input) 
+                         for batch_range in batch_ranges]
+        
+        # Generate outlines for all batches with limited concurrency
+        max_concurrent = 2  # Limit concurrent requests to avoid overloading Ollama
+        batch_results = generate_text_batch(model_name, batch_prompts, 
+                                           num_ctx=DEFAULT_CONTEXT_SIZE, 
+                                           max_concurrent=max_concurrent)
+        
+        # Process each batch result
+        for batch_idx, (batch_range, outline_text) in enumerate(zip(batch_ranges, batch_results)):
+            start_chapter, end_chapter = batch_range
+            log_message(f"Processing outline batch for chapters {start_chapter} to {end_chapter}...")
             
-            # Create a batch-specific prompt
-            batch_prompt = f"""
-            Generate a detailed outline for chapters {batch_start+1} to {batch_end} of a book based on this premise:
-            
-            {initial_prompt}
-            {style_prompt}
-            {world_building_prompt}
-            {character_prompt}
-            {target_audience_prompt}
-            
-            For each chapter, provide the following information in this exact format:
-            
-            Chapter [Number]: [Title]
-            Key Events:
-            - [Event 1]
-            - [Event 2]
-            - [Event 3]
-            Character Developments: [Brief description of character developments]
-            Setting: [Brief description of the setting]
-            Tone: [Brief description of the emotional tone]
-            
-            Make sure each chapter has a unique title and at least 3 key events.
-            Start your response with "OUTLINE:" and end with "END OF OUTLINE"
-            """
-            
-            # Use a larger context window for Ollama (8192 is a good balance)
-            outline_text = generate_text(model_name, batch_prompt, num_ctx=8192)
+            # Check for errors
+            if outline_text.startswith("Error:"):
+                log_message(f"Error generating outline batch {batch_idx+1}: {outline_text}")
+                continue
             
             # Process the batch outline
-            batch_chapters = process_outline(outline_text, batch_end - batch_start)
+            batch_chapters = process_outline(outline_text, end_chapter - start_chapter + 1)
             
             # Adjust chapter numbers
-            for i, chapter in enumerate(batch_chapters, batch_start + 1):
+            for i, chapter in enumerate(batch_chapters, start_chapter):
                 chapter["chapter_number"] = i
             
             # Add to our collection
             all_chapters.extend(batch_chapters)
+        
+        # Check if we have any chapters
+        if not all_chapters:
+            log_message("Failed to generate any valid outline chapters.")
+            return "", "Failed to generate outline. Please try again with different parameters."
+        
+        # If we have fewer chapters than requested, fill in with placeholders
+        while len(all_chapters) < num_chapters:
+            next_num = len(all_chapters) + 1
+            all_chapters.append({
+                "chapter_number": next_num,
+                "title": f"Chapter {next_num}",
+                "prompt": "- Key Events:\n- Event 1\n- Event 2\n- Event 3\n- Character Developments: Character development continues\n- Setting: Setting for this chapter\n- Tone: Tone for this chapter"
+            })
+        
+        # Ensure proper chapter numbering and sort by chapter number
+        for i, chapter in enumerate(all_chapters, 1):
+            chapter["chapter_number"] = i
+        
+        # Sort chapters by chapter number
+        all_chapters.sort(key=lambda x: x["chapter_number"])
         
         # Set the complete outline
         current_outline = all_chapters
@@ -905,7 +1059,7 @@ def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
         
         # Save the outline to file
         outline_path = os.path.join(current_book_folder, "outline.txt")
-        with open(outline_path, "w") as f:
+        with open(outline_path, "w", encoding="utf-8") as f:
             for chapter in all_chapters:
                 f.write(f"\nChapter {chapter['chapter_number']}: {chapter['title']}\n")
                 f.write("-" * 50 + "\n")
@@ -940,44 +1094,75 @@ def generate_outline(initial_prompt, num_chapters, model_name, style_input=""):
                 
                 conn.commit()
         
-        msg = f"✓ Outline generation complete! Saved to {outline_path}"
-        log_message(msg)
-        return formatted_outline, msg
+        msg = f"v Outline generation complete! Saved to {outline_path}"
+        logger.info(msg)
+        return formatted_outline, log_message(msg)
     
     except Exception as e:
         error_msg = f"Error generating outline: {str(e)}"
-        log_message(error_msg)
-        return "", error_msg
+        logger.error(error_msg, exc_info=True)
+        return "", log_message(error_msg)
 
 def process_outline(outline_text, num_chapters):
-    """Process outline text into structured chapters"""
+    """
+    Process outline text into structured chapters with improved error handling
+    
+    Args:
+        outline_text: Text output from the LLM containing the outline
+        num_chapters: Expected number of chapters
+        
+    Returns:
+        List of chapter dictionaries with structured information
+    """
     import re
     
     # Extract the outline content between markers
+    outline_content = outline_text
     if "OUTLINE:" in outline_text:
         start_idx = outline_text.find("OUTLINE:")
         end_idx = outline_text.find("END OF OUTLINE")
         if end_idx == -1:
             end_idx = len(outline_text)
         outline_content = outline_text[start_idx:end_idx].strip()
-    else:
-        outline_content = outline_text
     
     # Split by chapter headers
-    chapter_sections = re.split(r'Chapter \d+:', outline_content)
+    # Regular expression to match "Chapter X: Title" pattern
+    chapter_pattern = re.compile(r'Chapter\s+(\d+)\s*:\s*(.*?)(?=\n|$)', re.IGNORECASE)
+    
+    # Find all chapter headers with chapter numbers and titles
+    chapter_matches = list(chapter_pattern.finditer(outline_content))
+    
+    # If no chapter headers found, try alternative split method
+    if not chapter_matches:
+        logger.warning("No properly formatted chapter headers found. Attempting alternative parsing.")
+        return process_outline_alternative(outline_content, num_chapters)
     
     chapters = []
-    for i, section in enumerate(chapter_sections[1:], 1):  # Skip first empty section
+    
+    # Process each chapter
+    for i in range(len(chapter_matches)):
         try:
-            # Extract title
-            title_match = re.search(r'^\s*(.+?)(?=\n|$)', section)
-            title = title_match.group(1).strip() if title_match else f"Chapter {i}"
+            current_match = chapter_matches[i]
+            chapter_num = int(current_match.group(1))
+            chapter_title = current_match.group(2).strip()
             
-            # Extract key events, character developments, setting, tone
-            events_match = re.search(r'Key Events:(.+?)(?=Character Developments:|$)', section, re.DOTALL)
-            character_match = re.search(r'Character Developments:(.+?)(?=Setting:|$)', section, re.DOTALL)
-            setting_match = re.search(r'Setting:(.+?)(?=Tone:|$)', section, re.DOTALL)
-            tone_match = re.search(r'Tone:(.+?)(?=Chapter \d+:|$)', section, re.DOTALL)
+            # Find the content for this chapter
+            start_pos = current_match.end()
+            end_pos = len(outline_content)
+            if i < len(chapter_matches) - 1:
+                end_pos = chapter_matches[i + 1].start()
+            
+            chapter_content = outline_content[start_pos:end_pos].strip()
+            
+            # Extract key sections using patterns
+            events_match = re.search(r'Key Events:(.*?)(?=Character Developments:|Setting:|Tone:|$)', 
+                                  chapter_content, re.DOTALL | re.IGNORECASE)
+            character_match = re.search(r'Character Developments:(.*?)(?=Setting:|Tone:|$)', 
+                                     chapter_content, re.DOTALL | re.IGNORECASE)
+            setting_match = re.search(r'Setting:(.*?)(?=Tone:|$)', 
+                                   chapter_content, re.DOTALL | re.IGNORECASE)
+            tone_match = re.search(r'Tone:(.*?)(?=$)', 
+                                chapter_content, re.DOTALL | re.IGNORECASE)
             
             # Extract content for each section or use placeholders
             events = events_match.group(1).strip() if events_match else "- Event 1\n- Event 2\n- Event 3"
@@ -987,25 +1172,25 @@ def process_outline(outline_text, num_chapters):
             
             # Format chapter info
             chapter_info = {
-                "chapter_number": i,
-                "title": title,
+                "chapter_number": chapter_num,
+                "title": chapter_title,
                 "prompt": "\n".join([
-                    f"- Key Events: {events}",
-                    f"- Character Developments: {character}",
-                    f"- Setting: {setting}",
-                    f"- Tone: {tone}"
+                    f"Key Events: {events}",
+                    f"Character Developments: {character}",
+                    f"Setting: {setting}",
+                    f"Tone: {tone}"
                 ])
             }
             
             chapters.append(chapter_info)
             
         except Exception as e:
-            print(f"Error processing Chapter {i}: {str(e)}")
+            logger.error(f"Error processing Chapter {i+1}: {str(e)}")
             # Add a minimal placeholder chapter
             chapters.append({
-                "chapter_number": i,
-                "title": f"Chapter {i}",
-                "prompt": "- Key Events:\n- Event 1\n- Event 2\n- Event 3\n- Character Developments: Character development continues\n- Setting: Setting for this chapter\n- Tone: Tone for this chapter"
+                "chapter_number": i+1,
+                "title": f"Chapter {i+1}",
+                "prompt": "Key Events:\n- Event 1\n- Event 2\n- Event 3\nCharacter Developments: Character development continues\nSetting: Setting for this chapter\nTone: Tone for this chapter"
             })
     
     # Ensure we have the requested number of chapters
@@ -1014,7 +1199,7 @@ def process_outline(outline_text, num_chapters):
         chapters.append({
             "chapter_number": next_num,
             "title": f"Chapter {next_num}",
-            "prompt": "- Key Events:\n- Event 1\n- Event 2\n- Event 3\n- Character Developments: Character development continues\n- Setting: Setting for this chapter\n- Tone: Tone for this chapter"
+            "prompt": "Key Events:\n- Event 1\n- Event 2\n- Event 3\nCharacter Developments: Character development continues\nSetting: Setting for this chapter\nTone: Tone for this chapter"
         })
     
     # Trim extra chapters
@@ -1027,6 +1212,120 @@ def process_outline(outline_text, num_chapters):
     
     return chapters
 
+def process_outline_alternative(outline_content, num_chapters):
+    """
+    Alternative method to process outline text when regular parsing fails
+    
+    Args:
+        outline_content: Text output from the LLM containing the outline
+        num_chapters: Expected number of chapters
+        
+    Returns:
+        List of chapter dictionaries with structured information
+    """
+    # Split content by lines
+    lines = outline_content.split('\n')
+    
+    chapters = []
+    current_chapter = None
+    current_section = None
+    
+    # Simplified parsing logic
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Try to identify a chapter header
+        if line.lower().startswith("chapter") or re.match(r'^\d+\.\s+', line):
+            # Save previous chapter if exists
+            if current_chapter:
+                chapters.append(current_chapter)
+            
+            # Extract title
+            title = line
+            if ':' in line:
+                title = line.split(':', 1)[1].strip()
+            
+            # Create new chapter
+            current_chapter = {
+                "chapter_number": len(chapters) + 1,
+                "title": title,
+                "sections": {
+                    "Key Events": [],
+                    "Character Developments": "",
+                    "Setting": "",
+                    "Tone": ""
+                }
+            }
+            current_section = None
+            
+        elif current_chapter:
+            # Try to identify section headers
+            lower_line = line.lower()
+            if "key events" in lower_line or "events" in lower_line:
+                current_section = "Key Events"
+            elif "character" in lower_line and "develop" in lower_line:
+                current_section = "Character Developments"
+            elif "setting" in lower_line:
+                current_section = "Setting"
+            elif "tone" in lower_line:
+                current_section = "Tone"
+            elif current_section:
+                # Add content to current section
+                if current_section == "Key Events" and line.startswith("-"):
+                    current_chapter["sections"][current_section].append(line)
+                elif current_section == "Key Events" and current_chapter["sections"][current_section]:
+                    # Append to last event if not starting with bullet
+                    current_chapter["sections"][current_section][-1] += " " + line
+                else:
+                    current_chapter["sections"][current_section] = line
+    
+    # Add the last chapter
+    if current_chapter:
+        chapters.append(current_chapter)
+    
+    # Convert to standardized format
+    standardized_chapters = []
+    for i, chapter in enumerate(chapters, 1):
+        # Format events
+        events = "\n".join(chapter["sections"]["Key Events"]) if chapter["sections"]["Key Events"] else "- Event 1\n- Event 2\n- Event 3"
+        
+        # Format other sections
+        character = chapter["sections"]["Character Developments"] or "Character development continues"
+        setting = chapter["sections"]["Setting"] or "Setting for this chapter"
+        tone = chapter["sections"]["Tone"] or "Tone for this chapter"
+        
+        standardized_chapters.append({
+            "chapter_number": i,
+            "title": chapter["title"],
+            "prompt": "\n".join([
+                f"Key Events: {events}",
+                f"Character Developments: {character}",
+                f"Setting: {setting}",
+                f"Tone: {tone}"
+            ])
+        })
+    
+    # Ensure we have the requested number of chapters
+    while len(standardized_chapters) < num_chapters:
+        next_num = len(standardized_chapters) + 1
+        standardized_chapters.append({
+            "chapter_number": next_num,
+            "title": f"Chapter {next_num}",
+            "prompt": "Key Events:\n- Event 1\n- Event 2\n- Event 3\nCharacter Developments: Character development continues\nSetting: Setting for this chapter\nTone: Tone for this chapter"
+        })
+    
+    # Trim extra chapters
+    if len(standardized_chapters) > num_chapters:
+        standardized_chapters = standardized_chapters[:num_chapters]
+    
+    # Ensure proper chapter numbering
+    for i, chapter in enumerate(standardized_chapters, 1):
+        chapter["chapter_number"] = i
+    
+    return standardized_chapters
+
 def revise_chapter_outline(chapter_number, revision_prompt, model_name):
     """Revise a specific chapter outline based on user feedback"""
     global current_outline, current_book_data
@@ -1034,13 +1333,13 @@ def revise_chapter_outline(chapter_number, revision_prompt, model_name):
     try:
         if not current_book_folder:
             msg = "No active book project. Please create or load a book project first."
-            log_message(msg)
-            return "", msg
+            logger.warning(msg)
+            return "", log_message(msg)
         
         if not current_outline:
             msg = "No outline available. Please generate an outline first."
-            log_message(msg)
-            return "", msg
+            logger.warning(msg)
+            return "", log_message(msg)
         
         # Find the chapter to revise
         chapter_to_revise = None
@@ -1051,8 +1350,8 @@ def revise_chapter_outline(chapter_number, revision_prompt, model_name):
         
         if not chapter_to_revise:
             msg = f"Chapter {chapter_number} not found in the outline."
-            log_message(msg)
-            return "", msg
+            logger.warning(msg)
+            return "", log_message(msg)
         
         # Create the revision prompt
         revision_prompt_full = f"""
@@ -1075,8 +1374,13 @@ def revise_chapter_outline(chapter_number, revision_prompt, model_name):
         Start your response with "REVISED OUTLINE:" and end with "END OF REVISION"
         """
         
-        # Generate the revised outline
-        revised_text = generate_text(model_name, revision_prompt_full, num_ctx=4096)
+        # Generate the revised outline with increased context window
+        revised_text = generate_text(model_name, revision_prompt_full, num_ctx=DEFAULT_CONTEXT_SIZE)
+        
+        # Check for errors
+        if revised_text.startswith("Error:"):
+            logger.error(f"Error revising chapter: {revised_text}")
+            return "", log_message(f"Error revising chapter: {revised_text}")
         
         # Extract the revised outline
         if "REVISED OUTLINE:" in revised_text:
@@ -1134,21 +1438,23 @@ def revise_chapter_outline(chapter_number, revision_prompt, model_name):
             formatted_outline += f"## Chapter {chapter['chapter_number']}: {chapter['title']}\n"
             formatted_outline += f"{chapter['prompt']}\n\n"
         
-        msg = f"✓ Chapter {chapter_number} outline revised successfully!"
-        log_message(msg)
-        return formatted_outline, msg
+        msg = f"v Chapter {chapter_number} outline revised successfully!"
+        logger.info(msg)
+        return formatted_outline, log_message(msg)
     
     except Exception as e:
         error_msg = f"Error revising chapter outline: {str(e)}"
-        log_message(error_msg)
-        return "", error_msg
+        logger.error(error_msg, exc_info=True)
+        return "", log_message(error_msg)
 
 def generate_chapter(chapter_number, chapter_info, model_name):
-    """Generate a single chapter using Ollama"""
+    """Generate a single chapter using Ollama with increased context window and better error handling"""
     try:
         # Check if we have an active book project
         if not current_book_folder:
-            return "No active book project. Please create or load a book project first."
+            msg = "No active book project. Please create or load a book project first."
+            logger.warning(msg)
+            return log_message(msg)
         
         # Create the prompt for the chapter
         style_prompt = ""
@@ -1250,7 +1556,13 @@ def generate_chapter(chapter_number, chapter_info, model_name):
         """
         
         # Generate the chapter with a larger context window
-        chapter_content = generate_text(model_name, chapter_prompt, num_ctx=8192)
+        logger.info(f"Generating Chapter {chapter_number}: {chapter_info['title']}...")
+        chapter_content = generate_text(model_name, chapter_prompt, num_ctx=DEFAULT_CONTEXT_SIZE, timeout=120)
+        
+        # Check for errors
+        if chapter_content.startswith("Error:"):
+            logger.error(f"Error generating Chapter {chapter_number}: {chapter_content}")
+            return log_message(f"Error generating Chapter {chapter_number}: {chapter_content}")
         
         # Save the chapter
         save_path = os.path.join(current_book_folder, f"chapter_{chapter_number:02d}.txt")
@@ -1284,12 +1596,13 @@ def generate_chapter(chapter_number, chapter_info, model_name):
                 
                 conn.commit()
         
-        return f"✓ Chapter {chapter_number} written and saved to {save_path}"
+        logger.info(f"Chapter {chapter_number} generated and saved to {save_path}")
+        return f"v Chapter {chapter_number} written and saved to {save_path}"
     
     except Exception as e:
         error_msg = f"Error generating Chapter {chapter_number}: {str(e)}"
-        print(error_msg)
-        return error_msg
+        logger.error(error_msg, exc_info=True)
+        return log_message(error_msg)
 
 def calculate_estimated_completion_time():
     """Calculate estimated time to complete book generation"""
@@ -1338,7 +1651,7 @@ def update_progress_info():
     return progress_info
 
 def generate_book_thread(model_name, progress=gr.Progress()):
-    """Thread function for book generation"""
+    """Thread function for book generation with improved concurrency"""
     global current_outline, generation_active, generation_progress
     
     try:
@@ -1398,17 +1711,18 @@ def generate_book_thread(model_name, progress=gr.Progress()):
             time.sleep(1)
         
         progress(1.0, desc="Book generation complete")
-        log_message("✓ Book generation complete!")
+        log_message("v Book generation complete!")
         
     except Exception as e:
         error_msg = f"Error generating book: {str(e)}"
+        logger.error(error_msg, exc_info=True)
         log_message(error_msg)
     
     finally:
         generation_active = False
 
 def generate_selected_chapters(chapter_numbers, model_name, progress=gr.Progress()):
-    """Generate only selected chapters"""
+    """Generate only selected chapters with improved concurrency"""
     global current_outline, generation_active, generation_progress
     
     try:
@@ -1473,10 +1787,11 @@ def generate_selected_chapters(chapter_numbers, model_name, progress=gr.Progress
             time.sleep(1)
         
         progress(1.0, desc="Selected chapter generation complete")
-        log_message("✓ Selected chapter generation complete!")
+        log_message("v Selected chapter generation complete!")
         
     except Exception as e:
         error_msg = f"Error generating chapters: {str(e)}"
+        logger.error(error_msg, exc_info=True)
         log_message(error_msg)
     
     finally:
@@ -1542,10 +1857,12 @@ def combine_book():
         with open(full_book_path, "w", encoding="utf-8") as f:
             f.write(book_text)
         
-        return log_message(f"✓ Book combined successfully! Saved to {full_book_path}")
+        return log_message(f"v Book combined successfully! Saved to {full_book_path}")
     
     except Exception as e:
-        return log_message(f"Error combining book: {str(e)}")
+        error_msg = f"Error combining book: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        return log_message(error_msg)
 
 # World Building Functions
 def add_world_building_entry(category, content):
@@ -1598,7 +1915,7 @@ def add_world_building_entry(category, content):
         # Format the current world building data for display
         world_data_formatted = get_world_building_display()
         
-        msg = f"✓ Added world building entry: {category}"
+        msg = f"v Added world building entry: {category}"
         log_message(msg)
         return world_data_formatted, msg
     
@@ -1666,7 +1983,7 @@ def add_world_building_element(category, subcategory, name, content):
         # Format the current world building data for display
         world_data_formatted = get_world_building_hierarchy_display()
         
-        msg = f"✓ Added world building element: {category}/{subcategory}/{name}"
+        msg = f"v Added world building element: {category}/{subcategory}/{name}"
         log_message(msg)
         return world_data_formatted, msg
     
@@ -1709,7 +2026,7 @@ def edit_world_building_entry(category, new_content):
         # Format the current world building data for display
         world_data_formatted = get_world_building_display()
         
-        msg = f"✓ Updated world building entry: {category}"
+        msg = f"v Updated world building entry: {category}"
         log_message(msg)
         return world_data_formatted, msg
     
@@ -1755,7 +2072,7 @@ def edit_world_building_element(category, subcategory, name, new_content):
         # Format the current world building data for display
         world_data_formatted = get_world_building_hierarchy_display()
         
-        msg = f"✓ Updated world building element: {category}/{subcategory}/{name}"
+        msg = f"v Updated world building element: {category}/{subcategory}/{name}"
         log_message(msg)
         return world_data_formatted, msg
     
@@ -1798,7 +2115,7 @@ def delete_world_building_entry(category):
         # Format the current world building data for display
         world_data_formatted = get_world_building_display()
         
-        msg = f"✓ Deleted world building entry: {category}"
+        msg = f"v Deleted world building entry: {category}"
         log_message(msg)
         return world_data_formatted, msg
     
@@ -1852,7 +2169,7 @@ def delete_world_building_element(category, subcategory, name):
         # Format the current world building data for display
         world_data_formatted = get_world_building_hierarchy_display()
         
-        msg = f"✓ Deleted world building element: {category}/{subcategory}/{name}"
+        msg = f"v Deleted world building element: {category}/{subcategory}/{name}"
         log_message(msg)
         return world_data_formatted, msg
     
@@ -2010,7 +2327,7 @@ def add_character(name, description):
         # Format the current character data for display
         char_data_formatted = get_characters_display()
         
-        msg = f"✓ Added character: {name}"
+        msg = f"v Added character: {name}"
         log_message(msg)
         return char_data_formatted, msg
     
@@ -2121,7 +2438,7 @@ def add_character_relationship(character1, character2, relationship_type, descri
         # Format the current character relationships for display
         rel_data_formatted = get_character_relationships_display()
         
-        msg = f"✓ Added relationship between {character1} and {character2}"
+        msg = f"v Added relationship between {character1} and {character2}"
         log_message(msg)
         return rel_data_formatted, msg
     
@@ -2182,7 +2499,7 @@ def add_character_arc(character_name, arc_points):
         # Format the current character arcs for display
         arc_data_formatted = get_character_arcs_display()
         
-        msg = f"✓ Added development arc for {character_name}"
+        msg = f"v Added development arc for {character_name}"
         log_message(msg)
         return arc_data_formatted, msg
     
@@ -2225,7 +2542,7 @@ def edit_character(name, new_description):
         # Format the current character data for display
         char_data_formatted = get_characters_display()
         
-        msg = f"✓ Updated character: {name}"
+        msg = f"v Updated character: {name}"
         log_message(msg)
         return char_data_formatted, msg
     
@@ -2297,7 +2614,7 @@ def delete_character(name):
         # Format the current character data for display
         char_data_formatted = get_characters_display()
         
-        msg = f"✓ Deleted character: {name}"
+        msg = f"v Deleted character: {name}"
         log_message(msg)
         return char_data_formatted, msg
     
@@ -2435,7 +2752,7 @@ def set_target_audience(age_min, age_max, reading_level, neurodivergent_accommod
                 
                 conn.commit()
         
-        msg = f"✓ Set target audience specifications for '{current_book_title}'"
+        msg = f"v Set target audience specifications for '{current_book_title}'"
         log_message(msg)
         return msg
     
@@ -2508,7 +2825,7 @@ def add_neurodivergent_accommodation(accommodation_type, description):
                 
                 conn.commit()
         
-        msg = f"✓ Added neurodivergent accommodation: {accommodation_type}"
+        msg = f"v Added neurodivergent accommodation: {accommodation_type}"
         log_message(msg)
         return msg
     
@@ -2549,7 +2866,7 @@ def add_content_guideline(guideline):
         
         # We won't add this to the database since we don't have a dedicated table for it
         
-        msg = f"✓ Added content guideline"
+        msg = f"v Added content guideline"
         log_message(msg)
         return msg
     
@@ -2681,7 +2998,7 @@ def process_flowchart_input(flowchart_data):
             save_book_metadata()
             added_elements.append("Plot outline (converted to chapters)")
         
-        msg = f"✓ Processed flowchart input and added {len(added_elements)} elements"
+        msg = f"v Processed flowchart input and added {len(added_elements)} elements"
         log_message(msg)
         return msg + "\n\n" + "\n".join(added_elements)
     
@@ -2801,7 +3118,7 @@ def find_and_replace(old_text, new_text):
         if metadata_updated:
             save_book_metadata()
         
-        return log_message(f"✓ Replaced '{old_text}' with '{new_text}' ({total_replacements} replacements in {modified_files} files)")
+        return log_message(f"v Replaced '{old_text}' with '{new_text}' ({total_replacements} replacements in {modified_files} files)")
     
     except Exception as e:
         error_msg = f"Error performing find and replace: {str(e)}"
@@ -2845,7 +3162,7 @@ def update_chapter_content(chapter_number, new_content):
                 )
                 conn.commit()
         
-        return log_message(f"✓ Updated Chapter {chapter_number}. Backup saved as {backup_file}")
+        return log_message(f"v Updated Chapter {chapter_number}. Backup saved as {backup_file}")
     
     except Exception as e:
         error_msg = f"Error updating chapter: {str(e)}"
@@ -2947,14 +3264,14 @@ def export_book_project(format_type="txt"):
             export_path = os.path.join(current_book_folder, f"{export_filename}.txt")
             with open(export_path, "w", encoding="utf-8") as f:
                 f.write(book_content)
-            return log_message(f"✓ Book exported as text file: {export_path}")
+            return log_message(f"v Book exported as text file: {export_path}")
         
         elif format_type == "markdown":
             # Markdown export (already in markdown format)
             export_path = os.path.join(current_book_folder, f"{export_filename}.md")
             with open(export_path, "w", encoding="utf-8") as f:
                 f.write(book_content)
-            return log_message(f"✓ Book exported as Markdown file: {export_path}")
+            return log_message(f"v Book exported as Markdown file: {export_path}")
         
         elif format_type == "pdf" and export_capabilities["pdf"]:
             # PDF export using reportlab
@@ -3001,7 +3318,7 @@ def export_book_project(format_type="txt"):
             # Build the PDF
             doc.build(story)
             
-            return log_message(f"✓ Book exported as PDF file: {export_path}")
+            return log_message(f"v Book exported as PDF file: {export_path}")
         
         elif format_type == "epub" and export_capabilities["epub"]:
             # EPUB export
@@ -3082,7 +3399,7 @@ def export_book_project(format_type="txt"):
             # Write the EPUB file
             epub.write_epub(export_path, book, {})
             
-            return log_message(f"✓ Book exported as EPUB file: {export_path}")
+            return log_message(f"v Book exported as EPUB file: {export_path}")
         
         elif format_type == "docx" and export_capabilities["docx"]:
             # DOCX export
@@ -3117,7 +3434,7 @@ def export_book_project(format_type="txt"):
             # Save the document
             doc.save(export_path)
             
-            return log_message(f"✓ Book exported as DOCX file: {export_path}")
+            return log_message(f"v Book exported as DOCX file: {export_path}")
         
         else:
             if format_type not in ["txt", "markdown", "pdf", "epub", "docx"]:
@@ -3212,7 +3529,7 @@ def get_current_book_info():
             
             for chapter in current_book_data["chapters"]:
                 chapter_file = f"chapter_{chapter['chapter_number']:02d}.txt"
-                chapter_status = "✓" if chapter_file in os.listdir(current_book_folder) else "□"
+                chapter_status = "v" if chapter_file in os.listdir(current_book_folder) else "□"
                 info += f"{chapter_status} Chapter {chapter['chapter_number']}: {chapter['title']}\n"
         
         return info
@@ -3222,7 +3539,7 @@ def get_current_book_info():
 
 # Create the Gradio interface
 def create_gradio_interface():
-    """Create and return the Gradio interface with outline revision capability"""
+    """Create and return the Gradio interface with improved outline generation"""
     with gr.Blocks(title="Geeky Ghost Writer", theme=gr.themes.Soft()) as app:
         gr.Markdown("# 👻 Geeky Ghost Writer")
         gr.Markdown("""This application uses Ollama to generate books based on your prompts. 
@@ -4474,10 +4791,6 @@ def create_gradio_interface():
             ),
             inputs=[chapter_selection, models_dropdown],
             outputs=[log_output]
-        ).then(
-            update_generation_status,
-            inputs=None,
-            outputs=[progress_display]
         )
         
         stop_btn.click(
@@ -4660,8 +4973,14 @@ initialize_database()
 # Main entry point
 if __name__ == "__main__":
     # Display startup message
-    print("Starting Geeky Ghost Writer...")
-    print("Make sure Ollama is running on http://localhost:11434")
+    logger.info("Starting Geeky Ghost Writer...")
+    logger.info("Make sure Ollama is running on http://localhost:11434")
+    
+    # Check Ollama connection
+    if check_ollama_running():
+        logger.info("Successfully connected to Ollama")
+    else:
+        logger.warning("Could not connect to Ollama. Make sure it's running before using the application.")
     
     # Create and launch the app
     app = create_gradio_interface()
